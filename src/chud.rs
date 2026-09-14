@@ -1,0 +1,196 @@
+//! The chud: a cute pixel critter for each session. "Chud" means eating a lot, so it gets
+//! fatter the longer its agent works. Drawn with half-block pixels, like Claude's crab.
+use ratatui::prelude::*;
+use std::time::Duration;
+
+const BODY: Color = Color::Rgb(0xff, 0xc2, 0x7a);
+const EDGE: Color = Color::Rgb(0xe8, 0x94, 0x4f);
+const BELLY: Color = Color::Rgb(0xff, 0xe6, 0xc2);
+const EYE: Color = Color::Rgb(0x2b, 0x1d, 0x16);
+const SHINE: Color = Color::Rgb(0xff, 0xff, 0xff);
+const BLUSH: Color = Color::Rgb(0xff, 0x8f, 0xa8);
+const MOUTH: Color = Color::Rgb(0x9c, 0x33, 0x3f);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Mood {
+    Munching,
+    Waiting,
+    Happy,
+    Sleepy,
+}
+
+/// 0..=4 by minutes the agent has spent working: snack, meal, feast, buffet, food coma.
+pub fn fatness(worked: Duration) -> usize {
+    match worked.as_secs() / 60 {
+        0..5 => 0,
+        5..20 => 1,
+        20..60 => 2,
+        60..180 => 3,
+        _ => 4,
+    }
+}
+
+pub type Pixels = Vec<Vec<Option<Color>>>;
+
+fn put(px: &mut Pixels, x: usize, y: usize, c: Color) {
+    if let Some(p) = px.get_mut(y).and_then(|row| row.get_mut(x)) {
+        *p = Some(c);
+    }
+}
+
+/// A chud 10 px tall (5 lines, for dashboard cards) that widens with `fat`;
+/// `frame` alternates the chewing animation.
+pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
+    let fat = fat.min(4);
+    let (h, w) = (10, 10 + 2 * fat);
+    let body_h = h - 1; // the bottom row is feet
+    let inside = |x: isize, y: isize| {
+        if x < 0 || y < 0 || x >= w as isize || y >= body_h as isize {
+            return false;
+        }
+        let dx = (x as f32 + 0.5 - w as f32 / 2.0) / (w as f32 / 2.0);
+        let dy = (y as f32 + 0.5 - body_h as f32 / 2.0) / (body_h as f32 / 2.0);
+        dx * dx + dy * dy <= 1.0
+    };
+    let mut px: Pixels = vec![vec![None; w]; h];
+    for y in 0..body_h {
+        for x in 0..w {
+            let (xi, yi) = (x as isize, y as isize);
+            if inside(xi, yi) {
+                let edge = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|(a, b)| !inside(xi + a, yi + b));
+                put(&mut px, x, y, if edge { EDGE } else { BODY });
+            }
+        }
+    }
+    let chewing = mood == Mood::Munching && frame % 2 == 0;
+
+    // belly: a lighter patch below the face that grows with the body
+    let (bx, by) = (w as f32 / 2.0, body_h as f32 * 0.74);
+    let (rx, ry) = (w as f32 * 0.32, body_h as f32 * 0.22);
+    for y in 5..body_h {
+        for x in 0..w {
+            let dx = (x as f32 + 0.5 - bx) / rx;
+            let dy = (y as f32 + 0.5 - by) / ry;
+            if dx * dx + dy * dy <= 1.0 && px[y][x] == Some(BODY) {
+                put(&mut px, x, y, BELLY);
+            }
+        }
+    }
+
+    let (c0, c1, d) = (w / 2 - 1, w / 2, 1 + fat / 2);
+    let (left, right) = (c0 - d, c1 + d); // inner pixel of each 2x2 eye
+    for (inner, outer) in [(left, left - 1), (right, right + 1)] {
+        if mood != Mood::Sleepy {
+            put(&mut px, inner, 3, SHINE);
+            put(&mut px, outer, 3, EYE);
+        }
+        put(&mut px, inner, 4, EYE);
+        put(&mut px, outer, 4, EYE);
+    }
+    put(&mut px, left - 1, 5, BLUSH);
+    put(&mut px, right + 1, 5, BLUSH);
+    let mouth = match mood {
+        Mood::Munching if chewing => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
+        Mood::Munching | Mood::Sleepy => vec![(c0, 6, EDGE), (c1, 6, EDGE)],
+        Mood::Waiting => vec![(c0, 6, MOUTH), (c1, 6, MOUTH)],
+        Mood::Happy => vec![(c0 - 1, 5, EYE), (c1 + 1, 5, EYE), (c0, 6, EYE), (c1, 6, EYE)],
+    };
+    for (x, y, c) in mouth {
+        put(&mut px, x, y, c);
+    }
+    let foot = c0 - 1 - fat / 2;
+    for x in [foot - 1, foot, w - 1 - foot, w - foot] {
+        put(&mut px, x, h - 1, EDGE);
+    }
+    px
+}
+
+/// Renders pixels two rows per line: ▀ takes the top pixel's colour, its background the bottom's.
+pub fn lines(px: &Pixels) -> Vec<Line<'static>> {
+    px.chunks(2)
+        .map(|rows| {
+            let bottom = rows.get(1);
+            let cells = (0..rows[0].len()).map(|x| match (rows[0][x], bottom.and_then(|r| r[x])) {
+                (Some(t), Some(b)) => Span::styled("▀", Style::new().fg(t).bg(b)),
+                (Some(t), None) => Span::styled("▀", Style::new().fg(t)),
+                (None, Some(b)) => Span::styled("▄", Style::new().fg(b)),
+                (None, None) => Span::raw(" "),
+            });
+            Line::from(cells.collect::<Vec<_>>())
+        })
+        .collect()
+}
+
+/// A `width`-cell progress bar with eighth-cell precision: green, amber past 60%, red past 85%.
+pub fn bar(ratio: f64, width: usize) -> Span<'static> {
+    let r = ratio.clamp(0.0, 1.0);
+    let color = match r {
+        r if r >= 0.85 => Color::Rgb(0xf2, 0x6d, 0x6d),
+        r if r >= 0.6 => Color::Rgb(0xf5, 0xc1, 0x5a),
+        _ => Color::Rgb(0x8b, 0xd4, 0x7a),
+    };
+    let eighths = (r * width as f64 * 8.0).round() as usize;
+    let (full, part) = (eighths / 8, eighths % 8);
+    let mut s = "█".repeat(full.min(width));
+    if part > 0 && full < width {
+        s.push([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'][part]);
+    }
+    let used = s.chars().count();
+    s.push_str(&" ".repeat(width - used));
+    Span::styled(s, Style::new().fg(color).bg(Color::Rgb(0x33, 0x33, 0x3a)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ascii(px: &Pixels) -> String {
+        let ch = |c: Option<Color>| match c {
+            None => ' ',
+            Some(BODY) => 'o',
+            Some(EDGE) => '#',
+            Some(BELLY) => '.',
+            Some(EYE) => '@',
+            Some(SHINE) => '*',
+            Some(BLUSH) => '+',
+            Some(MOUTH) => 'm',
+            Some(_) => '?',
+        };
+        px.iter().map(|r| r.iter().map(|&c| ch(c)).collect::<String>() + "\n").collect()
+    }
+
+    #[test]
+    fn grows_with_work() {
+        let widths: Vec<usize> = (0..5).map(|f| sprite(f, Mood::Happy, 0)[0].len()).collect();
+        assert_eq!(widths, [10, 12, 14, 16, 18]);
+        assert_eq!(fatness(Duration::from_secs(3 * 60)), 0);
+        assert_eq!(fatness(Duration::from_secs(90 * 60)), 3);
+        assert_eq!(lines(&sprite(2, Mood::Happy, 0)).len(), 5, "10 px tall = 5 lines");
+    }
+
+    #[test]
+    fn chews_while_working() {
+        assert_ne!(sprite(1, Mood::Munching, 0), sprite(1, Mood::Munching, 1));
+        assert_eq!(sprite(1, Mood::Happy, 0), sprite(1, Mood::Happy, 1));
+    }
+
+    #[test]
+    fn progress_bar() {
+        let text = |r, w| bar(r, w).content.to_string();
+        assert_eq!(text(0.0, 4), "    ");
+        assert_eq!(text(0.5, 4), "██  ");
+        assert_eq!(text(1.0, 4), "████");
+        assert_eq!(text(0.53, 4), "██▏ ");
+        assert_eq!(text(3.0, 4), "████", "clamped");
+    }
+
+    // `cargo test preview -- --nocapture` prints every sprite, for eyeballing the art
+    #[test]
+    fn preview() {
+        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy] {
+            for fat in [0, 2, 4] {
+                println!("{mood:?} fat {fat}\n{}", ascii(&sprite(fat, mood, 0)));
+            }
+        }
+    }
+}

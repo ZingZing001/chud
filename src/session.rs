@@ -1,0 +1,518 @@
+use crate::usage::{self, Usage};
+use anyhow::Result;
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc::Sender, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Status {
+    #[default]
+    Idle,
+    Working,
+    NeedsInput,
+    Done,
+    Exited,
+}
+
+pub enum Event {
+    Input(crossterm::event::Event),
+    Output(usize),
+    Exited(usize),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Agent {
+    Claude,
+    Copilot,
+    Shell,
+    Other(String),
+}
+
+/// Classifies the program at `path` (a session's foreground process, or a command name).
+pub fn agent_of(path: &str) -> Agent {
+    let name = path.rsplit('/').next().unwrap_or(path).trim_start_matches('-'); // login shells: "-zsh"
+    match name {
+        "claude" => Agent::Claude,
+        _ if path.contains("/claude/versions/") => Agent::Claude, // native install: .../claude/versions/2.1.270
+        "copilot" => Agent::Copilot,
+        "zsh" | "bash" | "fish" | "sh" | "dash" | "nu" => Agent::Shell,
+        _ => Agent::Other(name.to_string()),
+    }
+}
+
+/// A chat title from the terminal title: drops Claude's spinner glyphs, Copilot's suffix and
+/// the placeholder titles both show before the first prompt.
+pub fn chat_name(title: &str) -> Option<String> {
+    let t = title.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
+    let t = t.strip_suffix(" - GitHub Copilot").unwrap_or(t).trim();
+    (!matches!(t, "" | "Claude Code" | "GitHub Copilot")).then(|| t.to_string())
+}
+
+/// vt100 callbacks: turns the agent's escape sequences into status, chat name and ids.
+#[derive(Default)]
+pub struct Signals {
+    pub status: Status,
+    pub title: String,
+    pub chat: String,
+    pub summary: String,
+    pub sid: String,
+    pub agent_cwd: String,
+    reply: Vec<u8>,
+}
+
+impl vt100::Callbacks for Signals {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.set(Status::NeedsInput, None);
+    }
+
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = String::from_utf8_lossy(title).into_owned();
+        // keep the last real name: claude clears its title on exit
+        if let Some(chat) = chat_name(&self.title) {
+            self.chat = chat;
+        }
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, p: &[&[u8]]) {
+        let rest = |i: usize| String::from_utf8_lossy(&p[i..].join(&b';')).into_owned();
+        match p {
+            // progress (Copilot): 0 = cleared, anything else = busy
+            [b"9", b"4", state, ..] => {
+                self.set(if *state == b"0" { Status::Done } else { Status::Working }, None)
+            }
+            [b"9", ..] => self.set(Status::NeedsInput, Some(rest(1))),
+            [b"777", b"notify", b"warp://cli-agent", ..] => self.warp(&rest(3)),
+            [b"777", b"notify", _, ..] => self.set(Status::NeedsInput, Some(rest(3))),
+            _ => {}
+        }
+    }
+
+    // Answer the two queries TUIs block on at startup (cursor position, device attributes).
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        match (i1, c, p0) {
+            (None, 'n', 6) => {
+                let (row, col) = screen.cursor_position();
+                self.reply
+                    .extend(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+            }
+            (None, 'c', 0) => self.reply.extend(b"\x1b[?62;22c"),
+            _ => {}
+        }
+    }
+}
+
+impl Signals {
+    fn set(&mut self, status: Status, summary: Option<String>) {
+        // A bell/notify only means "needs you" mid-turn; after the turn it's claude's
+        // 60s "still waiting" reminder, which must not flip Done back.
+        if status == Status::NeedsInput && self.status != Status::Working {
+            return;
+        }
+        self.status = status;
+        if let Some(s) = summary {
+            self.summary = s;
+        }
+    }
+
+    // Payloads from the installed claude-code-warp plugin (scripts/build-payload.sh).
+    fn warp(&mut self, json: &str) {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+        let field = |k: &str| v[k].as_str().filter(|s| !s.is_empty()).map(String::from);
+        if let Some(s) = field("session_id") {
+            self.sid = s;
+        }
+        if let Some(s) = field("cwd") {
+            self.agent_cwd = s;
+        }
+        // vte keeps only 16 OSC params, so a payload with many ';' arrives truncated.
+        // "event" sits near the front, so fall back to reading just that.
+        let event = v["event"].as_str().or_else(|| json.split("\"event\":\"").nth(1)?.split('"').next());
+        let status = match event {
+            Some("prompt_submit" | "tool_complete") => Status::Working,
+            Some("permission_request") => Status::NeedsInput,
+            Some("stop" | "stop_failure") => Status::Done,
+            _ => return,
+        };
+        self.set(status, field("summary").or(field("response")).or(field("query")));
+    }
+}
+
+pub struct Session {
+    pub id: usize,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub parser: Arc<Mutex<vt100::Parser<Signals>>>,
+    pub name: Option<String>,
+    pub group: usize,
+    pub agent: Agent,
+    pub sid: String,
+    pub seen: Status,
+    pub unread: bool,
+    pub working_since: Option<Instant>,
+    /// total time the agent spent working in earlier stretches (the chud's diet)
+    pub worked: Duration,
+    pub usage: Usage,
+    pub exit: Option<u32>,
+    probed: Instant,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+impl Session {
+    pub fn spawn(
+        id: usize,
+        argv: Vec<String>,
+        cwd: PathBuf,
+        (rows, cols): (u16, u16),
+        tx: Sender<Event>,
+    ) -> Result<Self> {
+        let agent = agent_of(&argv[0]);
+        // Pick the agent's session id ourselves so we can find its log and resume it later.
+        let mut run = argv.clone();
+        let mut sid = resumed_id(&argv).unwrap_or_default();
+        if matches!(agent, Agent::Claude | Agent::Copilot) && !continues(&argv) {
+            sid = uuid();
+            run.extend(["--session-id".to_string(), sid.clone()]);
+        }
+
+        let pair = native_pty_system().openpty(size(rows, cols))?;
+        let mut cmd = CommandBuilder::new(&run[0]);
+        cmd.args(&run[1..]);
+        cmd.cwd(&cwd);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("TERM_PROGRAM", "ghostty"); // copilot only emits OSC 9;4 progress for terminals it knows
+        // If chud was started from inside a Claude Code session, drop that session's identity:
+        // claude refuses to start "inside" it (CLAUDECODE), and an interactive claude that
+        // inherits the rest never writes its transcript (no usage numbers, nothing to resume).
+        // User settings such as CLAUDE_CODE_USE_BEDROCK pass through.
+        for var in [
+            "CLAUDECODE",
+            "CLAUDE_PID",
+            "CLAUDE_EFFORT",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_BRIDGE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_EXECPATH",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_SESSION_ATTENDED",
+        ] {
+            cmd.env_remove(var);
+        }
+        // ponytail: poses as Warp so the installed claude-code-warp plugin reports status;
+        // ship our own hooks.json plugin if Warp changes that protocol.
+        cmd.env("WARP_CLI_AGENT_PROTOCOL_VERSION", "1");
+        cmd.env("WARP_CLIENT_VERSION", "v0.2099.01.01.00.00.stable_00");
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            5000,
+            Signals::default(),
+        )));
+        let (p, w) = (parser.clone(), writer.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while let Ok(n @ 1..) = reader.read(&mut buf) {
+                let reply = {
+                    let mut p = p.lock().unwrap();
+                    p.process(&buf[..n]);
+                    std::mem::take(&mut p.callbacks_mut().reply)
+                };
+                if !reply.is_empty() {
+                    let _ = w.lock().unwrap().write_all(&reply);
+                }
+                if tx.send(Event::Output(id)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(Event::Exited(id));
+        });
+
+        Ok(Self {
+            id,
+            argv,
+            cwd,
+            parser,
+            name: None,
+            group: 0,
+            agent,
+            sid,
+            seen: Status::Idle,
+            unread: false,
+            working_since: None,
+            worked: Duration::ZERO,
+            usage: Usage::default(),
+            exit: None,
+            probed: Instant::now(),
+            writer,
+            master: pair.master,
+            child,
+        })
+    }
+
+    pub fn write(&self, bytes: &[u8]) {
+        let _ = self.writer.lock().unwrap().write_all(bytes);
+    }
+
+    pub fn paste(&self, text: &str) {
+        let text = text.replace("\r\n", "\r").replace('\n', "\r");
+        if self.parser.lock().unwrap().screen().bracketed_paste() {
+            self.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
+        } else {
+            self.write(text.as_bytes());
+        }
+    }
+
+    pub fn resize(&self, (rows, cols): (u16, u16)) {
+        let _ = self.master.resize(size(rows, cols));
+        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+    }
+
+    pub fn status(&self) -> Status {
+        match self.exit {
+            Some(_) => Status::Exited,
+            None => self.parser.lock().unwrap().callbacks().status,
+        }
+    }
+
+    /// Sidebar name: your rename, else the chat's title, else the folder.
+    pub fn label(&self) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
+        let chat = self.parser.lock().unwrap().callbacks().chat.clone();
+        if chat.is_empty() { self.folder() } else { chat }
+    }
+
+    /// All the time the agent has spent working, including the current stretch.
+    pub fn worked(&self) -> Duration {
+        self.worked + self.working_since.map_or(Duration::ZERO, |t| t.elapsed())
+    }
+
+    pub fn folder(&self) -> String {
+        base(&self.cwd)
+    }
+
+    /// Last prompt / response / permission request, on one line.
+    pub fn detail(&self) -> String {
+        let p = self.parser.lock().unwrap();
+        p.callbacks().summary.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The agent's own session id: as reported by the plugin, else the one we assigned.
+    pub fn agent_sid(&self) -> String {
+        let p = self.parser.lock().unwrap();
+        let reported = &p.callbacks().sid;
+        if reported.is_empty() { self.sid.clone() } else { reported.clone() }
+    }
+
+    /// Re-checks which program is in front, at most once a second. True if it changed.
+    pub fn probe(&mut self) -> bool {
+        if self.exit.is_some() || self.probed.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.probed = Instant::now();
+        let Some(agent) = self.master.process_group_leader().and_then(proc_path).map(|p| agent_of(&p))
+        else {
+            return false;
+        };
+        if agent == self.agent {
+            return false;
+        }
+        self.agent = agent;
+        let mut p = self.parser.lock().unwrap();
+        let s = p.callbacks_mut();
+        s.chat.clear(); // a different program: the old chat name and summary no longer apply
+        s.summary.clear();
+        true
+    }
+
+    pub fn refresh_usage(&mut self) {
+        let copilot = match self.agent {
+            Agent::Copilot => true,
+            Agent::Claude => false,
+            _ => return,
+        };
+        let sid = self.agent_sid();
+        let agent_cwd = self.parser.lock().unwrap().callbacks().agent_cwd.clone();
+        let cwd = if agent_cwd.is_empty() { self.cwd.clone() } else { PathBuf::from(agent_cwd) };
+        if let Some(path) = usage::log_path(copilot, &sid, &cwd) {
+            self.usage.refresh(&path, copilot);
+        }
+    }
+
+    pub fn reap(&mut self) {
+        self.exit = Some(self.child.wait().map(|s| s.exit_code()).unwrap_or(1));
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Session id named on the command line (`--resume <id>`, `--session-id <id>`, `--resume=<id>`).
+fn resumed_id(argv: &[String]) -> Option<String> {
+    argv.iter().enumerate().find_map(|(i, a)| match a.as_str() {
+        "--session-id" | "--resume" | "-r" => argv.get(i + 1).filter(|v| !v.starts_with('-')).cloned(),
+        _ => a.strip_prefix("--resume=").or(a.strip_prefix("--session-id=")).map(String::from),
+    })
+}
+
+/// Claude rejects --session-id together with these.
+fn continues(argv: &[String]) -> bool {
+    argv.iter().any(|a| {
+        matches!(a.as_str(), "-c" | "--continue" | "-r" | "--resume" | "--session-id")
+            || a.starts_with("--resume=")
+            || a.starts_with("--session-id=")
+    })
+}
+
+fn uuid() -> String {
+    let mut b = [0u8; 16];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    b[6] = b[6] & 0x0f | 0x40; // version 4
+    b[8] = b[8] & 0x3f | 0x80; // RFC 4122 variant
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+#[cfg(target_os = "macos")]
+fn proc_path(pid: i32) -> Option<String> {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is valid for its full length, which is what we pass.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn proc_path(pid: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+fn size(rows: u16, cols: u16) -> PtySize {
+    PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
+}
+
+fn base(p: &Path) -> String {
+    p.file_name().map_or("/".into(), |n| n.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(bytes: &[u8]) -> Signals {
+        let mut p = vt100::Parser::new_with_callbacks(40, 120, 0, Signals::default());
+        p.process(bytes);
+        std::mem::take(p.callbacks_mut())
+    }
+
+    #[test]
+    fn progress_and_notify() {
+        assert_eq!(feed(b"\x1b]9;4;3;0\x07").status, Status::Working);
+        assert_eq!(feed(b"\x1b]9;4;3;0\x07\x1b]9;4;0;0\x07").status, Status::Done);
+        let s = feed(b"\x1b]9;4;3;0\x07\x07");
+        assert_eq!(s.status, Status::NeedsInput, "bell while working");
+        let s = feed(b"\x1b]9;4;3;0\x07\x1b]777;notify;Claude;Needs your permission\x07");
+        assert_eq!((s.status, s.summary.as_str()), (Status::NeedsInput, "Needs your permission"));
+        let s = feed(b"\x1b]9;4;3;0\x07\x1b]9;4;0;0\x07\x1b]9;still waiting\x07\x07");
+        assert_eq!(s.status, Status::Done, "reminders after the turn don't flip Done");
+    }
+
+    #[test]
+    fn warp_plugin_payloads() {
+        let osc = |json: &str| format!("\x1b]777;notify;warp://cli-agent;{json}\x07");
+        let s = feed(osc(r#"{"v":1,"agent":"claude","event":"prompt_submit","query":"fix it; now"}"#).as_bytes());
+        assert_eq!((s.status, s.summary.as_str()), (Status::Working, "fix it; now"));
+        let working = osc(r#"{"event":"prompt_submit"}"#);
+        let perm = osc(r#"{"event":"permission_request","summary":"Wants to run Bash: rm -rf x"}"#);
+        let s = feed(format!("{working}{perm}").as_bytes());
+        assert_eq!((s.status, s.summary.as_str()), (Status::NeedsInput, "Wants to run Bash: rm -rf x"));
+        let s = feed(osc(r#"{"event":"stop","query":"q","response":"All done"}"#).as_bytes());
+        assert_eq!((s.status, s.summary.as_str()), (Status::Done, "All done"));
+        let s = feed(osc(r#"{"event":"session_start","session_id":"abc","cwd":"/x"}"#).as_bytes());
+        assert_eq!((s.status, s.sid.as_str(), s.agent_cwd.as_str()), (Status::Idle, "abc", "/x"));
+        let semis = ";".repeat(30);
+        let perm = osc(&format!(r#"{{"v":1,"event":"permission_request","summary":"x{semis}y"}}"#));
+        let s = feed(format!("{working}{perm}").as_bytes());
+        assert_eq!(s.status, Status::NeedsInput, "truncated payload still yields the event");
+    }
+
+    #[test]
+    fn answers_startup_queries() {
+        assert_eq!(feed(b"\x1b[6n").reply, b"\x1b[1;1R");
+        assert_eq!(feed(b"\x1b[c").reply, b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn chat_names() {
+        assert_eq!(chat_name("✳ Reply with hi").as_deref(), Some("Reply with hi"));
+        assert_eq!(chat_name("◐ Fix auth token refresh").as_deref(), Some("Fix auth token refresh"));
+        let copilot = chat_name("Calculate Simple Addition - GitHub Copilot");
+        assert_eq!(copilot.as_deref(), Some("Calculate Simple Addition"));
+        for t in ["✳ Claude Code", "GitHub Copilot", "", "✳ "] {
+            assert_eq!(chat_name(t), None, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn agents() {
+        assert_eq!(agent_of("/Users/me/.local/share/claude/versions/2.1.270"), Agent::Claude);
+        assert_eq!(agent_of("claude"), Agent::Claude);
+        assert_eq!(agent_of("/Users/me/.local/bin/copilot"), Agent::Copilot);
+        assert_eq!(agent_of("/bin/zsh"), Agent::Shell);
+        assert_eq!(agent_of("-zsh"), Agent::Shell);
+        assert_eq!(agent_of("/usr/bin/vim"), Agent::Other("vim".into()));
+    }
+
+    #[test]
+    fn session_ids() {
+        let u = uuid();
+        assert_eq!((u.len(), &u[14..15], &u[8..9]), (36, "4", "-"));
+        assert_ne!(u, uuid());
+        let v = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(resumed_id(&v("claude --resume abc")).as_deref(), Some("abc"));
+        assert_eq!(resumed_id(&v("copilot --resume=abc")).as_deref(), Some("abc"));
+        assert_eq!(resumed_id(&v("claude --model opus")), None);
+        assert!(continues(&v("claude -c")) && !continues(&v("claude --model opus")));
+    }
+
+    // Raw PTY output recorded from a real `copilot` run: prompt -> work -> finish.
+    #[test]
+    fn copilot_recording() {
+        let s = feed(include_bytes!("../fixtures/copilot.raw"));
+        assert_eq!(s.status, Status::Done);
+        assert!(s.title.contains("Copilot"), "title: {}", s.title);
+        assert_eq!(s.chat, "Run Shell Command Date");
+    }
+
+    // Raw PTY output recorded from a real `claude` run: trust dialog -> prompt -> stop ->
+    // 60s idle reminder (OSC 9 + BEL) -> Ctrl-C (which clears the title).
+    #[test]
+    fn claude_recording() {
+        let s = feed(include_bytes!("../fixtures/claude.raw"));
+        assert_eq!(s.status, Status::Done);
+        assert_eq!(s.summary, "Reply with only the word hi.");
+        assert_eq!(s.chat, "Reply with hi");
+        assert_eq!(s.sid, "2b1e6bc2-4b99-4f56-ab36-2d31aeadc6fd");
+    }
+}
