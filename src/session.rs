@@ -164,6 +164,9 @@ pub struct Session {
     pub usage: Usage,
     pub exit: Option<u32>,
     probed: Instant,
+    /// the process in front (the agent, when one runs), and the Copilot session found for it
+    fg_pid: Option<i32>,
+    found: Option<String>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -261,6 +264,8 @@ impl Session {
             usage: Usage::default(),
             exit: None,
             probed: Instant::now(),
+            fg_pid: None,
+            found: None,
             writer,
             master: pair.master,
             child,
@@ -329,10 +334,11 @@ impl Session {
             return false;
         }
         self.probed = Instant::now();
-        let Some(agent) = self.master.process_group_leader().and_then(proc_path).map(|p| agent_of(&p))
-        else {
-            return false;
-        };
+        let Some(pid) = self.master.process_group_leader() else { return false };
+        let Some(agent) = proc_path(pid).map(|p| agent_of(&p)) else { return false };
+        if self.fg_pid != Some(pid) {
+            (self.fg_pid, self.found) = (Some(pid), None);
+        }
         if agent == self.agent {
             return false;
         }
@@ -350,9 +356,26 @@ impl Session {
             Agent::Claude => false,
             _ => return,
         };
-        let sid = self.agent_sid();
+        // the running agent's own session, found by its pid: this also covers an agent
+        // started by hand in a shell, where chud didn't choose the session id
+        let home = std::env::var("HOME").map(PathBuf::from);
+        let by_pid = match (self.fg_pid, &home) {
+            (Some(pid), Ok(home)) if copilot && self.found.is_none() => {
+                self.found = find_sid(home, &self.agent, pid).map(|(sid, _)| sid);
+                None
+            }
+            (Some(pid), Ok(home)) if !copilot => find_sid(home, &self.agent, pid),
+            _ => None,
+        };
+        let (sid, found_cwd) = match (by_pid, &self.found) {
+            (Some((sid, cwd)), _) => (sid, cwd),
+            (None, Some(sid)) if copilot => (sid.clone(), None),
+            _ => (self.agent_sid(), None),
+        };
         let agent_cwd = self.parser.lock().unwrap().callbacks().agent_cwd.clone();
-        let cwd = if agent_cwd.is_empty() { self.cwd.clone() } else { PathBuf::from(agent_cwd) };
+        let cwd = found_cwd
+            .or_else(|| Some(PathBuf::from(&agent_cwd)).filter(|_| !agent_cwd.is_empty()))
+            .unwrap_or_else(|| self.cwd.clone());
         if let Some(path) = usage::log_path(copilot, &sid, &cwd) {
             self.usage.refresh(&path, copilot);
         }
@@ -366,6 +389,24 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
+    }
+}
+
+/// The agent's own session for the process `pid`: Claude keeps ~/.claude/sessions/<pid>.json
+/// (session id and folder), Copilot marks its session folder with inuse.<pid>.lock.
+fn find_sid(home: &Path, agent: &Agent, pid: i32) -> Option<(String, Option<PathBuf>)> {
+    match agent {
+        Agent::Claude => {
+            let text = std::fs::read_to_string(home.join(format!(".claude/sessions/{pid}.json"))).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            Some((v["sessionId"].as_str()?.to_string(), v["cwd"].as_str().map(PathBuf::from)))
+        }
+        Agent::Copilot => std::fs::read_dir(home.join(".copilot/session-state"))
+            .ok()?
+            .flatten()
+            .find(|e| e.path().join(format!("inuse.{pid}.lock")).exists())
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), None)),
+        _ => None,
     }
 }
 
@@ -494,6 +535,21 @@ mod tests {
         assert_eq!(resumed_id(&v("copilot --resume=abc")).as_deref(), Some("abc"));
         assert_eq!(resumed_id(&v("claude --model opus")), None);
         assert!(continues(&v("claude -c")) && !continues(&v("claude --model opus")));
+    }
+
+    #[test]
+    fn finds_agent_sessions_by_pid() {
+        let home = std::env::temp_dir().join(format!("chud-find-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
+        std::fs::create_dir_all(home.join(".copilot/session-state/cop-1")).unwrap();
+        std::fs::write(home.join(".claude/sessions/4242.json"), r#"{"pid":4242,"sessionId":"abc","cwd":"/x"}"#).unwrap();
+        std::fs::write(home.join(".copilot/session-state/cop-1/inuse.77.lock"), "77").unwrap();
+        let found = |agent, pid| find_sid(&home, &agent, pid);
+        assert_eq!(found(Agent::Claude, 4242), Some(("abc".into(), Some(PathBuf::from("/x")))));
+        assert_eq!(found(Agent::Copilot, 77), Some(("cop-1".into(), None)));
+        assert_eq!(found(Agent::Claude, 1), None);
+        assert_eq!(found(Agent::Shell, 4242), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // Raw PTY output recorded from a real `copilot` run: prompt -> work -> finish.

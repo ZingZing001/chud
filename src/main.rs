@@ -22,17 +22,17 @@ use std::time::{Duration, Instant};
 const FRAME: Duration = Duration::from_millis(16);
 const TICK: Duration = Duration::from_secs(1);
 const SIDE: u16 = 38;
-const DEFAULT_CMD: &str = "zsh"; // what a new session runs unless you type something else
+const DEFAULT_CMD: &str = "zsh"; // what a new terminal runs
 
 enum Ask {
-    New,
     Commit,
     Kill,
     Discard,
     Quit,
     Rename,
     Group,
-    GroupRename,
+    GroupRename(usize), // index into App.groups
+    NewGroup,
 }
 
 struct Prompt {
@@ -53,6 +53,7 @@ impl Diff {
         self.scroll = 0;
         self.text = match self.files.get(self.sel) {
             Some((code, path)) => git::diff(&self.root, code, path),
+            None if git::root(&self.root).is_err() => "Not a git repository, so there's nothing to review.".into(),
             None => "working tree clean".into(),
         };
     }
@@ -108,15 +109,18 @@ enum Hit {
     Backdrop,
 }
 
+/// Menu actions; the numbers are indexes into App.sessions, or App.groups for group actions.
 #[derive(Clone, Copy, Debug)]
 enum Act {
     Rename(usize),
     Group(usize),
-    New(usize),
+    NewTerminal(usize),
+    NewGroup,
     Diff(usize),
     Kill(usize),
     GroupRename(usize),
     Fold(usize),
+    DeleteGroup(usize),
 }
 
 struct Menu {
@@ -190,7 +194,6 @@ struct App {
     dash_scroll: u16,
     help: bool,
     menu: Option<Menu>,
-    msg: String,
     focused: bool,
     quit: bool,
     next_id: usize,
@@ -206,8 +209,13 @@ struct App {
 
 fn main() -> Result<()> {
     let mut term = ratatui::init();
-    let modes = || execute!(stdout(), ct::DisableMouseCapture, ct::DisableBracketedPaste, ct::DisableFocusChange);
-    execute!(stdout(), ct::EnableMouseCapture, ct::EnableBracketedPaste, ct::EnableFocusChange)?;
+    // Also switch off "alternate scroll" (mode 1007): with it, some terminals (chud.app's among
+    // them) turn the wheel into Up/Down arrow keys in full-screen apps, which reached the agent.
+    use crossterm::style::Print;
+    let modes = || {
+        execute!(stdout(), ct::DisableMouseCapture, ct::DisableBracketedPaste, ct::DisableFocusChange, Print("\x1b[?1007h"))
+    };
+    execute!(stdout(), ct::EnableMouseCapture, ct::EnableBracketedPaste, ct::EnableFocusChange, Print("\x1b[?1007l"))?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = modes();
@@ -241,7 +249,6 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         dash_scroll: 0,
         help: false,
         menu: None,
-        msg: String::new(),
         focused: true,
         quit: false,
         next_id: 0,
@@ -274,9 +281,6 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     }
     if app.sessions.is_empty() {
         app.open(DEFAULT_CMD); // like any terminal app: start with a shell
-    }
-    if app.sessions.is_empty() {
-        app.tool(Tool::New);
     }
 
     let mut hits = vec![];
@@ -323,6 +327,9 @@ impl App {
             Event::Output(id) => match self.sessions.iter().position(|s| s.id == id) {
                 Some(i) => {
                     let agent = self.sessions[i].probe();
+                    if agent {
+                        self.sessions[i].refresh_usage(); // a new agent in front: follow its usage
+                    }
                     let status = self.check_status(i);
                     agent || status || (i == self.sel && self.diff.is_none() && !self.dash)
                 }
@@ -462,7 +469,7 @@ impl App {
                     s.write(&[1]);
                 }
             }
-            KeyCode::Char('n') => self.tool(Tool::New),
+            KeyCode::Char('n') => self.new_terminal(self.cur_group()),
             KeyCode::Char('j') | KeyCode::Down => self.step(1),
             KeyCode::Char('k') | KeyCode::Up => self.step(-1),
             KeyCode::Char(c @ '1'..='9') => {
@@ -476,10 +483,7 @@ impl App {
             KeyCode::Char('?') => self.tool(Tool::Help),
             KeyCode::Char('r') if has => self.prompt = ask(Ask::Rename, self.sessions[self.sel].label()),
             KeyCode::Char('g') if has => self.prompt = ask(Ask::Group, String::new()),
-            KeyCode::Char('G') if has => {
-                let gi = self.cur_group();
-                self.prompt = ask(Ask::GroupRename, self.groups[gi].name.clone());
-            }
+            KeyCode::Char('G') if has => self.run_act(Act::GroupRename(self.cur_group())),
             KeyCode::Char('z') if has => {
                 let gi = self.cur_group();
                 self.groups[gi].collapsed ^= true;
@@ -498,7 +502,11 @@ impl App {
 
     fn tool(&mut self, t: Tool) {
         match t {
-            Tool::New => self.prompt = Some(Prompt { ask: Ask::New, input: DEFAULT_CMD.into() }),
+            // a drop-down under the + New button
+            Tool::New => {
+                let items = vec![("New terminal session", Act::NewTerminal(self.cur_group())), ("New group…", Act::NewGroup)];
+                self.menu = Some(Menu { x: 7, y: 1, items });
+            }
             Tool::Dash => {
                 self.dash = !self.dash;
                 self.diff = None;
@@ -544,11 +552,11 @@ impl App {
 
     fn submit(&mut self, ask: Ask, input: &str) {
         match ask {
-            Ask::New => self.open(input),
             Ask::Commit if !input.is_empty() => {
-                if let Some(d) = &self.diff {
-                    self.msg = git::commit_all(&d.root, input).unwrap_or_else(|e| e);
-                    self.refresh_diff();
+                let failed = self.diff.as_ref().and_then(|d| git::commit_all(&d.root, input).err());
+                self.refresh_diff();
+                if let (Some(e), Some(d)) = (failed, &mut self.diff) {
+                    d.text = e; // shown in the diff view, where you committed
                 }
             }
             Ask::Rename => {
@@ -561,14 +569,16 @@ impl App {
                 self.save();
             }
             Ask::Group if self.sel < self.sessions.len() => self.move_to_group(input),
-            Ask::GroupRename if !input.is_empty() => {
-                if self.groups.iter().any(|g| g.name == input) {
-                    self.msg = format!("a group named {input} already exists");
-                } else {
-                    let gi = self.cur_group();
-                    self.groups[gi].name = input.to_string();
-                    self.save();
+            // names stay unique: C-a g moves sessions by group name
+            Ask::GroupRename(gi) if !input.is_empty() && !self.groups.iter().any(|g| g.name == input) => {
+                if let Some(g) = self.groups.get_mut(gi) {
+                    g.name = input.to_string();
                 }
+                self.save();
+            }
+            Ask::NewGroup if !input.is_empty() => {
+                self.group_id(input);
+                self.save();
             }
             _ => {}
         }
@@ -578,19 +588,16 @@ impl App {
         match ask {
             Ask::Kill if self.sel < self.sessions.len() => {
                 self.sessions.remove(self.sel); // Drop kills the child
-                self.prune_groups();
                 self.select(self.sel.min(self.sessions.len().saturating_sub(1)));
                 self.save();
             }
             Ask::Discard => {
-                if let Some(d) = &self.diff {
-                    if let Some((code, path)) = d.files.get(d.sel) {
-                        if let Err(e) = git::discard(&d.root, code, path) {
-                            self.msg = e;
-                        }
-                    }
-                }
+                let file = self.diff.as_ref().and_then(|d| Some((d.root.clone(), d.files.get(d.sel)?.clone())));
+                let failed = file.and_then(|(root, (code, path))| git::discard(&root, &code, &path).err());
                 self.refresh_diff();
+                if let (Some(e), Some(d)) = (failed, &mut self.diff) {
+                    d.text = e;
+                }
             }
             Ask::Quit => self.quit = true,
             _ => {}
@@ -617,27 +624,30 @@ impl App {
             Some("shell") => argv[0] = std::env::var("SHELL").unwrap_or("zsh".into()),
             _ => {}
         }
-        if let Some(i) = self.spawn(argv, cwd) {
+        let group = self.sessions.get(self.sel).map_or(0, |s| s.group);
+        if let Some(i) = self.spawn(argv, cwd, group) {
             self.select(i);
             self.save();
         }
     }
 
-    /// Starts a session in the selected session's group.
-    fn spawn(&mut self, argv: Vec<String>, cwd: PathBuf) -> Option<usize> {
-        let prog = argv[0].clone();
-        match Session::spawn(self.next_id, argv, cwd, self.pane(), self.tx.clone()) {
-            Ok(mut s) => {
-                s.group = self.sessions.get(self.sel).map_or(0, |cur| cur.group);
-                self.next_id += 1;
-                self.sessions.push(s);
-                Some(self.sessions.len() - 1)
-            }
-            Err(e) => {
-                self.msg = format!("{prog}: {e}");
-                None
-            }
+    /// A new zsh in group `gi`, in the selected session's folder (like a terminal's new tab).
+    fn new_terminal(&mut self, gi: usize) {
+        let cwd = self.sessions.get(self.sel).map(|s| s.cwd.clone());
+        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let group = self.groups.get(gi).map_or(0, |g| g.id);
+        if let Some(i) = self.spawn(vec![DEFAULT_CMD.into()], cwd, group) {
+            self.select(i);
+            self.save();
         }
+    }
+
+    fn spawn(&mut self, argv: Vec<String>, cwd: PathBuf, group: usize) -> Option<usize> {
+        let mut s = Session::spawn(self.next_id, argv, cwd, self.pane(), self.tx.clone()).ok()?;
+        s.group = group;
+        self.next_id += 1;
+        self.sessions.push(s);
+        Some(self.sessions.len() - 1)
     }
 
     fn rows(&self, expand_all: bool) -> Vec<Row> {
@@ -662,6 +672,7 @@ impl App {
         self.dash = false;
         if let Some(s) = self.sessions.get_mut(i) {
             s.unread = false;
+            s.refresh_usage(); // for the usage bar above its terminal
             let id = s.group;
             if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
                 g.collapsed = false;
@@ -708,19 +719,32 @@ impl App {
         }
     }
 
+    /// The id of the group with this name, creating it if needed.
+    fn group_id(&mut self, name: &str) -> usize {
+        if let Some(g) = self.groups.iter().find(|g| g.name == name) {
+            return g.id;
+        }
+        self.next_gid += 1;
+        self.groups.push(Group { id: self.next_gid, name: name.into(), collapsed: false });
+        self.next_gid
+    }
+
     /// Existing name moves there, a new name creates the group, empty means ungrouped.
     fn move_to_group(&mut self, name: &str) {
-        let id = match self.groups.iter().find(|g| g.name == name) {
-            _ if name.is_empty() => 0,
-            Some(g) => g.id,
-            None => {
-                self.next_gid += 1;
-                self.groups.push(Group { id: self.next_gid, name: name.into(), collapsed: false });
-                self.next_gid
-            }
-        };
+        let id = if name.is_empty() { 0 } else { self.group_id(name) };
         self.sessions[self.sel].group = id;
-        self.prune_groups();
+        self.save();
+    }
+
+    /// Deletes a named group; its sessions become ungrouped.
+    fn delete_group(&mut self, gi: usize) {
+        if gi == 0 || gi >= self.groups.len() {
+            return;
+        }
+        let id = self.groups.remove(gi).id;
+        for s in self.sessions.iter_mut().filter(|s| s.group == id) {
+            s.group = 0;
+        }
         self.save();
     }
 
@@ -744,13 +768,7 @@ impl App {
             _ => return,
         }
         self.sel = selected.and_then(|id| self.sessions.iter().position(|s| s.id == id)).unwrap_or(0);
-        self.prune_groups();
         self.save();
-    }
-
-    fn prune_groups(&mut self) {
-        let used: Vec<usize> = self.sessions.iter().map(|s| s.group).collect();
-        self.groups.retain(|g| g.id == 0 || used.contains(&g.id));
     }
 
     fn save(&self) {
@@ -801,29 +819,25 @@ impl App {
             let saved = usage::log_path(copilot, sid, &cwd).is_some_and(|p| p.exists());
             let run = resume_argv(&argv, sid, saved);
             let group = s["group"].as_u64().unwrap_or(0) as usize;
-            if let Some(i) = self.spawn(run, cwd) {
+            let group = if self.groups.iter().any(|g| g.id == group) { group } else { 0 };
+            if let Some(i) = self.spawn(run, cwd, group) {
                 let restored = &mut self.sessions[i];
                 restored.argv = argv;
                 restored.name = s["name"].as_str().map(String::from);
-                restored.group = if self.groups.iter().any(|g| g.id == group) { group } else { 0 };
                 restored.worked = Duration::from_secs(s["worked"].as_u64().unwrap_or(0));
                 restored.refresh_usage();
             }
         }
-        self.prune_groups();
         self.sel = self.visible().first().copied().unwrap_or(0);
     }
 
     fn open_diff(&mut self) {
         let Some(s) = self.sessions.get(self.sel) else { return };
-        match git::root(&s.cwd) {
-            Ok(root) => {
-                self.dash = false;
-                self.diff = Some(Diff { root, files: vec![], sel: 0, text: String::new(), scroll: 0 });
-                self.refresh_diff();
-            }
-            Err(e) => self.msg = e,
-        }
+        // outside a repo the view opens anyway and says so (Diff::load)
+        let root = git::root(&s.cwd).unwrap_or_else(|_| s.cwd.clone());
+        self.dash = false;
+        self.diff = Some(Diff { root, files: vec![], sel: 0, text: String::new(), scroll: 0 });
+        self.refresh_diff();
     }
 
     fn refresh_diff(&mut self) {
@@ -877,10 +891,9 @@ impl App {
                 self.select(i);
                 self.prompt = ask(Ask::Group, String::new());
             }
-            Act::New(i) => {
-                self.select(i);
-                self.tool(Tool::New);
-            }
+            Act::NewTerminal(gi) => self.new_terminal(gi),
+            Act::NewGroup => self.prompt = ask(Ask::NewGroup, String::new()),
+            Act::DeleteGroup(gi) => self.delete_group(gi),
             Act::Diff(i) => {
                 self.select(i);
                 self.open_diff();
@@ -890,10 +903,8 @@ impl App {
                 self.prompt = ask(Ask::Kill, String::new());
             }
             Act::GroupRename(gi) => {
-                let id = self.groups[gi].id;
-                if let Some(i) = self.sessions.iter().position(|s| s.group == id) {
-                    self.select(i);
-                    self.prompt = ask(Ask::GroupRename, self.groups[gi].name.clone());
+                if let Some(g) = self.groups.get(gi) {
+                    self.prompt = ask(Ask::GroupRename(gi), g.name.clone());
                 }
             }
             Act::Fold(gi) => {
@@ -912,6 +923,13 @@ impl App {
         let hit = self.hit_at(m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.press(hit, m),
+            // right-click opens the same menu as a row's … button
+            MouseEventKind::Down(MouseButton::Right) => match hit {
+                Some(Hit::Session(i) | Hit::SessionMenu(i)) => self.press(Some(Hit::SessionMenu(i)), m),
+                Some(Hit::Group(gi) | Hit::GroupMenu(gi)) => self.press(Some(Hit::GroupMenu(gi)), m),
+                Some(Hit::Pane) => self.to_pane(m),
+                _ => self.menu = None,
+            },
             MouseEventKind::Drag(MouseButton::Left) => self.drag_to(hit, m),
             MouseEventKind::Up(MouseButton::Left) => self.release(hit, m),
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -961,10 +979,11 @@ impl App {
                 self.drag = Some(Drag { from: h, at: (m.column, m.row), moved: false })
             }
             Some(Hit::SessionMenu(i)) => {
+                let gi = self.groups.iter().position(|g| g.id == self.sessions[i].group).unwrap_or(0);
                 self.menu = at(vec![
                     ("Rename…", Act::Rename(i)),
                     ("Move to group…", Act::Group(i)),
-                    ("New session here…", Act::New(i)),
+                    ("New terminal here", Act::NewTerminal(gi)),
                     ("Review changes", Act::Diff(i)),
                     ("Kill…", Act::Kill(i)),
                 ])
@@ -975,7 +994,15 @@ impl App {
             }
             Some(Hit::GroupMenu(gi)) => {
                 let fold = if self.groups[gi].collapsed { "Unfold" } else { "Fold" };
-                self.menu = at(vec![("Rename group…", Act::GroupRename(gi)), (fold, Act::Fold(gi))]);
+                let mut items = vec![
+                    ("New terminal here", Act::NewTerminal(gi)),
+                    ("Rename group…", Act::GroupRename(gi)),
+                    (fold, Act::Fold(gi)),
+                ];
+                if gi != 0 {
+                    items.push(("Delete group", Act::DeleteGroup(gi)));
+                }
+                self.menu = at(items);
             }
             Some(Hit::DiffFile(k)) => {
                 if let Some(d) = &mut self.diff {

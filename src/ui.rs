@@ -23,11 +23,11 @@ const SELECTED: Color = Color::Rgb(0x2c, 0x2a, 0x40); // the dim second line sta
 const CARD_W: u16 = 24;
 const CARD_H: u16 = 10;
 
-/// PTY size (rows, cols): the toolbar and status bar take a row each, the sidebar `side` columns.
-/// Never below 4x20: chud.app can start us before its window has a size, and vt100 panics
-/// when a line wraps on a 1-row screen (its col_wrap underflows the row).
+/// PTY size (rows, cols): the toolbar, the session's usage header and the status bar take a row
+/// each, the sidebar `side` columns. Never below 4x20: chud.app can start us before its window
+/// has a size, and vt100 panics when a line wraps on a 1-row screen (col_wrap underflows the row).
 pub fn pane(w: u16, h: u16, side: u16) -> (u16, u16) {
-    (h.saturating_sub(2).max(4), w.saturating_sub(side).max(20))
+    (h.saturating_sub(3).max(4), w.saturating_sub(side).max(20))
 }
 
 pub fn label(s: Status) -> &'static str {
@@ -137,11 +137,13 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
     } else if app.dash {
         dashboard(f, app, main, &mut hits);
     } else if let Some(s) = app.sessions.get(app.sel) {
+        let [head, term] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+        session_header(f, s, head);
         let p = s.parser.lock().unwrap();
         let screen = p.screen();
         let cursor = Cursor::default().visibility(!screen.hide_cursor() && screen.scrollback() == 0);
-        f.render_widget(PseudoTerminal::new(screen).cursor(cursor), main);
-        hits.push((main, Hit::Pane));
+        f.render_widget(PseudoTerminal::new(screen).cursor(cursor), term);
+        hits.push((term, Hit::Pane));
     } else {
         f.render_widget(Paragraph::new(" No sessions yet. Click + New, or press Ctrl-a n.").fg(DIM), main);
     }
@@ -159,11 +161,41 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
     hits
 }
 
+/// One line above the terminal: what's running in it and, for an agent, how full its context
+/// is. It follows whichever agent is in front, including one started by hand in a shell.
+fn session_header(f: &mut Frame, s: &Session, area: Rect) {
+    let mut spans = vec![Span::raw(" "), icon(&s.agent)];
+    match &s.agent {
+        Agent::Claude | Agent::Copilot => {
+            let u = &s.usage;
+            let who = if s.agent == Agent::Claude { "claude" } else { "copilot" };
+            let model = if u.model.is_empty() { String::new() } else { format!(" · {}", u.model) };
+            spans.push(format!("{who}{model}  ").bold());
+            spans.push(chud::bar(fullness(s), (area.width / 4).clamp(10, 40) as usize));
+            spans.push(format!(" {:.0}%  {} of {} context", fullness(s) * 100.0, tokens(u.context), tokens(u.limit())).into());
+            if u.output > 0 {
+                spans.push(format!(" · {} out", tokens(u.output)).fg(DIM));
+            }
+            if u.credits > 0.0 {
+                spans.push(format!(" · {:.1} credits", u.credits).fg(DIM));
+            }
+        }
+        Agent::Shell | Agent::Other(_) => {
+            let program = match &s.agent {
+                Agent::Other(name) => name.clone(),
+                _ => s.argv[0].rsplit('/').next().unwrap_or("shell").to_string(),
+            };
+            spans.push(format!("{program} · {}", s.cwd.display()).fg(DIM));
+        }
+    }
+    f.render_widget(Line::from(spans).bg(BAR_BG), area);
+}
+
 fn toolbar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let mut spans = vec![" chud ".fg(Color::Black).bg(PEACH).bold(), " ".into()];
     let mut x = area.x + 7;
     let buttons = [
-        (" + New ", Tool::New, false),
+        (" + New ▾ ", Tool::New, false),
         (" ▦ Dashboard ", Tool::Dash, app.dash),
         (" ± Diff ", Tool::Diff, app.diff.is_some()),
         (" ? Help ", Tool::Help, app.help),
@@ -464,7 +496,6 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     if waiting > 0 {
         spans.push(format!(" {waiting} need input ").black().on_magenta());
     }
-    spans.push(format!(" {}", app.msg).yellow());
     f.render_widget(Line::from(spans).bg(BAR_BG), area);
 }
 
@@ -489,10 +520,11 @@ fn menu(f: &mut Frame, m: &Menu, hits: &mut Hits) {
 
 const HELP: &[(&str, &str)] = &[
     ("click", "select a session · … opens its menu · a group header folds it"),
+    ("right-click", "a session or group header opens its menu"),
     ("drag", "a session onto another session or a group to move it"),
     ("drag edge", "the sidebar's right edge to resize it"),
-    ("toolbar", "+ New · Dashboard · Diff · Help"),
-    ("C-a n", "new session: command [dir]"),
+    ("toolbar", "+ New (terminal or group) · Dashboard · Diff · Help"),
+    ("C-a n", "new terminal (zsh) in this group"),
     ("C-a j / k / 1-9", "next / previous / nth session"),
     ("C-a Tab", "jump to the next session that needs you"),
     ("C-a r", "rename session (empty = automatic name)"),
@@ -520,11 +552,11 @@ fn help(f: &mut Frame) {
 
 fn prompt(f: &mut Frame, p: &Prompt, hits: &mut Hits) {
     let title = match p.ask {
-        Ask::New => " new session: <command> [dir]   e.g. claude ~/Projects/app ",
         Ask::Commit => " commit message (commits everything in the repo) ",
         Ask::Rename => " rename session (empty = automatic name) ",
         Ask::Group => " move to group: name (new name creates it, empty = ungrouped) ",
-        Ask::GroupRename => " rename group ",
+        Ask::GroupRename(_) => " rename group ",
+        Ask::NewGroup => " new group: name ",
         Ask::Kill => " kill this session? ",
         Ask::Discard => " discard all changes to this file? ",
         Ask::Quit => " sessions still running, quit and kill them? ",
@@ -558,7 +590,7 @@ mod tests {
 
     #[test]
     fn sessions_never_get_a_tiny_screen() {
-        assert_eq!(super::pane(120, 40, 38), (38, 82));
+        assert_eq!(super::pane(120, 40, 38), (37, 82));
         assert_eq!(super::pane(0, 0, 38), (4, 20), "a window app's first, unsized frame");
     }
 }
