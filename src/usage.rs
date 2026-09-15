@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Token counts for one agent session, read incrementally from the agent's own log.
 #[derive(Default)]
@@ -172,6 +173,55 @@ impl Usage {
     }
 }
 
+/// A plan usage window: percent used (0-100) and when it resets (Unix seconds, 0 if unknown).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Window {
+    pub used: f64,
+    pub resets_at: u64,
+}
+
+/// Plan limits shown above a session: Claude's 5-hour and weekly windows, and Copilot's
+/// monthly premium requests (with the month's entitlement).
+#[derive(Default)]
+pub struct Plan {
+    pub five_hour: Option<Window>,
+    pub seven_day: Option<Window>,
+    pub copilot: Option<(Window, u64)>,
+    pub copilot_checked: Option<Instant>,
+}
+
+pub fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Where `chud --statusline` keeps the plan limits Claude Code hands its status line.
+pub fn limits_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/chud/claude-limits.json")
+}
+
+/// Claude's 5-hour and weekly windows from its status-line `rate_limits` object.
+pub fn claude_windows(v: &Value, now: u64) -> [Option<Window>; 2] {
+    ["five_hour", "seven_day"].map(|k| -> Option<Window> {
+        let used = v[k]["used_percentage"].as_f64()?;
+        let resets_at = v[k]["resets_at"].as_u64().unwrap_or(0);
+        // past its reset a window starts empty again, until Claude reports the new one
+        Some(Window { used: if resets_at > 0 && now >= resets_at { 0.0 } else { used }, resets_at })
+    })
+}
+
+/// Copilot's monthly premium requests from `gh api /copilot_internal/user`.
+pub fn copilot_quota(v: &Value) -> Option<(Window, u64)> {
+    let q = &v["quota_snapshots"]["premium_interactions"];
+    if q["unlimited"] == true {
+        return None;
+    }
+    let used = 100.0 - q["percent_remaining"].as_f64()?;
+    let date = v["quota_reset_date_utc"].as_str().or(v["quota_reset_date"].as_str()).unwrap_or("");
+    let date = if date.len() == 10 { format!("{date}T00:00") } else { date.to_string() };
+    let resets_at = epoch_minute(&date).map_or(0, |m| m * 60);
+    Some((Window { used, resets_at }, q["entitlement"].as_u64().unwrap_or(0)))
+}
+
 fn number_after(s: &str, key: &str) -> Option<u64> {
     let rest = &s[s.find(key)? + key.len()..];
     rest[..rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len())].parse().ok()
@@ -238,6 +288,27 @@ mod tests {
         assert!((u.credits - 135.47169).abs() < 1e-6);
         let m = epoch_minute("2026-09-14T10:01:00Z").unwrap();
         assert_eq!(u.timeline.get(&m), Some(&500));
+    }
+
+    #[test]
+    fn plan_limits() {
+        let v: Value = serde_json::from_str(
+            r#"{"five_hour":{"used_percentage":23.5,"resets_at":2000},"seven_day":{"used_percentage":41.2,"resets_at":9000}}"#,
+        )
+        .unwrap();
+        let [h, w] = claude_windows(&v, 1000);
+        assert_eq!((h, w), (Some(Window { used: 23.5, resets_at: 2000 }), Some(Window { used: 41.2, resets_at: 9000 })));
+        assert_eq!(claude_windows(&v, 3000)[0].unwrap().used, 0.0, "past its reset the 5h window is empty again");
+        assert_eq!(claude_windows(&Value::Null, 0), [None, None]);
+
+        let gh: Value = serde_json::from_str(
+            r#"{"quota_reset_date":"2026-10-01","quota_snapshots":{"premium_interactions":{"entitlement":16100,"remaining":5044,"percent_remaining":31.3,"unlimited":false}}}"#,
+        )
+        .unwrap();
+        let (q, total) = copilot_quota(&gh).unwrap();
+        assert_eq!(total, 16100);
+        assert!((q.used - 68.7).abs() < 1e-9);
+        assert_eq!(q.resets_at, epoch_minute("2026-10-01T00:00Z").unwrap() * 60);
     }
 
     #[test]

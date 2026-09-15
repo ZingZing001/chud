@@ -20,6 +20,8 @@ pub enum Event {
     Input(crossterm::event::Event),
     Output(usize),
     Exited(usize),
+    /// Copilot's monthly premium-request quota, fetched from GitHub in the background
+    Copilot(Option<(usage::Window, u64)>),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

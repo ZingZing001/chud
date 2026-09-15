@@ -204,10 +204,14 @@ struct App {
     drag: Option<Drag>,
     hover: Option<Hit>,
     last_usage: Instant,
+    plan: usage::Plan,
     tx: mpsc::Sender<Event>,
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--statusline") {
+        return statusline();
+    }
     let mut term = ratatui::init();
     // Also switch off "alternate scroll" (mode 1007): with it, some terminals (chud.app's among
     // them) turn the wheel into Up/Down arrow keys in full-screen apps, which reached the agent.
@@ -259,6 +263,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         drag: None,
         hover: None,
         last_usage: Instant::now(),
+        plan: usage::Plan::default(),
         tx,
     };
     // chud.app starts us before its window has a size; wait briefly for the real one so the
@@ -282,6 +287,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     if app.sessions.is_empty() {
         app.open(DEFAULT_CMD); // like any terminal app: start with a shell
     }
+    app.refresh_plan();
 
     let mut hits = vec![];
     term.draw(|f| hits = ui::draw(f, &app))?;
@@ -346,6 +352,10 @@ impl App {
                 self.input(e);
                 true
             }
+            Event::Copilot(quota) => {
+                self.plan.copilot = quota;
+                true
+            }
         }
     }
 
@@ -371,6 +381,7 @@ impl App {
             if st == Status::Done && i == self.sel {
                 self.refresh_diff();
             }
+            self.refresh_plan();
         }
         true
     }
@@ -383,6 +394,7 @@ impl App {
             for s in self.sessions.iter_mut().filter(|s| all || s.working_since.is_some()) {
                 s.refresh_usage();
             }
+            self.refresh_plan();
             self.last_usage = Instant::now();
         }
     }
@@ -392,6 +404,26 @@ impl App {
             s.refresh_usage();
         }
         self.last_usage = Instant::now();
+    }
+
+    /// Plan limits for the session header. Claude's come from its status line (`chud
+    /// --statusline` saves them); Copilot's from GitHub, fetched in the background at most every
+    /// 5 minutes and only while a Copilot session exists.
+    fn refresh_plan(&mut self) {
+        let saved = std::fs::read_to_string(usage::limits_path()).ok();
+        if let Some(v) = saved.and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+            [self.plan.five_hour, self.plan.seven_day] = usage::claude_windows(&v, usage::now_secs());
+        }
+        let copilot = self.sessions.iter().any(|s| s.agent == Agent::Copilot);
+        if copilot && self.plan.copilot_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+            self.plan.copilot_checked = Some(Instant::now());
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let out = Command::new("gh").args(["api", "/copilot_internal/user"]).output();
+                let v = out.ok().and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
+                let _ = tx.send(Event::Copilot(v.as_ref().and_then(usage::copilot_quota)));
+            });
+        }
     }
 
     fn pane(&self) -> (u16, u16) {
@@ -678,6 +710,7 @@ impl App {
                 g.collapsed = false;
             }
         }
+        self.refresh_plan();
     }
 
     fn step(&mut self, by: isize) {
@@ -1068,6 +1101,35 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// `chud --statusline` is Claude Code's status-line command (set in ~/.claude/settings.json).
+/// After each reply Claude pipes in its session JSON; chud keeps the plan limits for its session
+/// header and prints them for Claude's own footer.
+fn statusline() -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let v: Value = serde_json::from_str(&input).unwrap_or_default();
+    let path = usage::limits_path();
+    let limits = if v["rate_limits"].is_object() {
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id())); // sessions run this at once
+        if std::fs::write(&tmp, v["rate_limits"].to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        v["rate_limits"].clone()
+    } else {
+        // not sent yet this session (it comes with the first reply): show the last known
+        std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    };
+    let pct = |w: Option<usage::Window>| w.map(|w| format!("{:.0}%", w.used));
+    match usage::claude_windows(&limits, usage::now_secs()).map(pct) {
+        [Some(h), Some(w)] => println!("5h {h} · week {w}"),
+        [Some(h), None] => println!("5h {h}"),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn notify(title: &str, body: &str) {

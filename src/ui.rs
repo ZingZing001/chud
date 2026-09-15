@@ -1,12 +1,13 @@
 use crate::chud::{self, Mood};
 use crate::session::{Agent, Session, Status};
+use crate::usage::{now_secs, Plan, Window};
 use crate::{App, Ask, Diff, DiffAct, Drag, Hit, Menu, Prompt, Row, Tool};
 use ratatui::prelude::*;
 use ratatui::symbols::Marker;
 use ratatui::widgets::{
     Axis, Bar, BarChart, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 /// Clickable regions from the last draw, topmost last.
@@ -93,6 +94,15 @@ fn elapsed(d: Duration) -> String {
     }
 }
 
+/// Time until a Unix timestamp: "14m05s", "2h14m", "15d 3h".
+fn until(at: u64) -> String {
+    match at.saturating_sub(now_secs()) {
+        0 => "now".into(),
+        s @ 1..86_400 => elapsed(Duration::from_secs(s)),
+        s => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
+    }
+}
+
 fn tokens(n: u64) -> String {
     match n {
         0 => "-".into(),
@@ -100,10 +110,6 @@ fn tokens(n: u64) -> String {
         1000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
         _ => format!("{:.2}M", n as f64 / 1e6),
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn mood(s: Status) -> Mood {
@@ -138,7 +144,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
         dashboard(f, app, main, &mut hits);
     } else if let Some(s) = app.sessions.get(app.sel) {
         let [head, term] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-        session_header(f, s, head);
+        session_header(f, s, &app.plan, head);
         let p = s.parser.lock().unwrap();
         let screen = p.screen();
         let cursor = Cursor::default().visibility(!screen.hide_cursor() && screen.scrollback() == 0);
@@ -161,23 +167,38 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
     hits
 }
 
-/// One line above the terminal: what's running in it and, for an agent, how full its context
-/// is. It follows whichever agent is in front, including one started by hand in a shell.
-fn session_header(f: &mut Frame, s: &Session, area: Rect) {
+/// One line above the terminal: what's running in it and, for an agent, your plan's usage:
+/// Claude's rolling 5-hour limit (plus the week), Copilot's monthly premium requests. It follows
+/// whichever agent is in front, including one started by hand in a shell. (Context fullness
+/// lives in the sidebar.)
+fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect) {
     let mut spans = vec![Span::raw(" "), icon(&s.agent)];
     match &s.agent {
         Agent::Claude | Agent::Copilot => {
-            let u = &s.usage;
-            let who = if s.agent == Agent::Claude { "claude" } else { "copilot" };
-            let model = if u.model.is_empty() { String::new() } else { format!(" · {}", u.model) };
-            spans.push(format!("{who}{model}  ").bold());
-            spans.push(chud::bar(fullness(s), (area.width / 4).clamp(10, 40) as usize));
-            spans.push(format!(" {:.0}%  {} of {} context", fullness(s) * 100.0, tokens(u.context), tokens(u.limit())).into());
-            if u.output > 0 {
-                spans.push(format!(" · {} out", tokens(u.output)).fg(DIM));
-            }
-            if u.credits > 0.0 {
-                spans.push(format!(" · {:.1} credits", u.credits).fg(DIM));
+            let claude = s.agent == Agent::Claude;
+            let model = if s.usage.model.is_empty() { String::new() } else { format!(" · {}", s.usage.model) };
+            spans.push(format!("{}{model}   ", if claude { "claude" } else { "copilot" }).bold());
+            let bar = |w: Window| chud::bar(w.used / 100.0, (area.width / 5).clamp(10, 30) as usize);
+            match (claude, plan.five_hour, plan.copilot) {
+                (true, Some(h), _) => {
+                    spans.extend([
+                        Span::raw("5h limit "),
+                        bar(h),
+                        format!(" {:.0}%", h.used).into(),
+                        format!("  resets in {}", until(h.resets_at)).fg(DIM),
+                    ]);
+                    if let Some(w) = plan.seven_day {
+                        spans.push(format!(" · week {:.0}%", w.used).fg(DIM));
+                    }
+                }
+                (false, _, Some((q, total))) => spans.extend([
+                    Span::raw("premium requests "),
+                    bar(q),
+                    format!(" {:.0}% of {total}", q.used).into(),
+                    format!("  resets in {}", until(q.resets_at)).fg(DIM),
+                ]),
+                (true, None, _) => spans.push("5h limit shows after Claude's next reply".fg(DIM)),
+                (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(DIM)),
             }
         }
         Agent::Shell | Agent::Other(_) => {
