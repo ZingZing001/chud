@@ -19,7 +19,7 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 | **Groups** | Put sessions in named, foldable groups; drag sessions to reorder or regroup them. |
 | **Dashboard** | Summary page with token charts, working time, and every agent's chud. |
 | **Diff review** | See the repo's changed files, then commit or discard without leaving chud. |
-| **Copy anything** | `C-a v` hands the mouse to the terminal so you can drag-select and ⌘C; `C-a y` copies the whole session view without the mouse. |
+| **Copy and paste** | Drag over the terminal to select and copy; ⌘V pastes. `C-a y` copies the whole session view. |
 | **Mouse-first UI** | Toolbar, `…` and right-click menus, drag and drop, resizable sidebar. Every action also has a keyboard shortcut. |
 | **Restore on restart** | Layout, groups, names and agent chats come back the next time you run `chud`. |
 | **Fast & idle-friendly** | Draws only when something changes; release builds use fat LTO. |
@@ -83,6 +83,8 @@ chud claude copilot     # open these sessions instead
 chud "claude --model opus" zsh
 ```
 
+Drag across the terminal to select text — letting go copies it, and ⌘V pastes it back.
+
 New sessions start in zsh; launch `claude` or `copilot` inside them and chud picks the agent up. Use **+ New ▾** in the toolbar for a new terminal or group. Click a session to switch, right-click it (or its `…`) for its menu, and drag it to move it.
 
 Every shortcut starts with the `Ctrl-a` prefix:
@@ -97,7 +99,7 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a z` | Fold / unfold this group |
 | `C-a J` / `K` | Move session down / up |
 | `C-a y` | Copy what this session shows to the clipboard |
-| `C-a v` | Select text with the mouse (⌘C copies); again to return |
+| `C-a v` | Hand the mouse to the terminal (holding ⌥ does the same) |
 | `C-a f` | Zoom: hide or show the sidebar |
 | `C-a d` | Diff review (`c` commit, `r` discard, `R` refresh) |
 | `C-a s` | Dashboard |

@@ -1,6 +1,7 @@
 use crate::chud::{self, Mood};
 use crate::session::{Agent, Session, Status};
-use crate::usage::{now_secs, Plan, Window};
+use crate::update::Update;
+use crate::usage::{local_minute, now_secs, Plan, Window};
 use crate::{App, Ask, Diff, DiffAct, Drag, Hit, Menu, Prompt, Row, Tool};
 use ratatui::prelude::*;
 use ratatui::symbols::Marker;
@@ -150,6 +151,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
         let screen = p.screen();
         let cursor = Cursor::default().visibility(!screen.hide_cursor() && screen.scrollback() == 0);
         f.render_widget(PseudoTerminal::new(screen).cursor(cursor), term);
+        picked(f, app, term);
         hits.push((term, Hit::Pane));
     } else {
         f.render_widget(Paragraph::new(" No sessions yet. Click + New, or press Ctrl-a n.").fg(DIM), main);
@@ -343,10 +345,11 @@ fn session_item(s: &Session, num: usize, headers: bool) -> ListItem<'static> {
 fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let order: Vec<usize> =
         app.rows(true).into_iter().filter_map(|r| if let Row::Session(i) = r { Some(i) } else { None }).collect();
-    let [head, tiles, charts, cards] = Layout::vertical([
+    let [head, tiles, charts, heat, cards] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(12),
+        Constraint::Length(11),
         Constraint::Min(0),
     ])
     .areas(area);
@@ -414,6 +417,8 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let block = Block::bordered().title(" who ate the most ").border_style(DIM);
     f.render_widget(BarChart::horizontal(bars).bar_width(1).bar_gap(0).block(block), bar_area);
 
+    activity(f, app, heat);
+
     hits.push((cards, Hit::Cards));
     let per_row = (cards.width / CARD_W).max(1);
     for (k, &i) in order.iter().skip(app.dash_scroll as usize * per_row as usize).enumerate() {
@@ -425,6 +430,75 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         card(f, &app.sessions[i], i == app.sel, r);
         hits.push((r, Hit::Card(i)));
     }
+}
+
+/// Lights up the cells a drag covered, the way any terminal shows a selection: from the first
+/// cell to the last in reading order, not as a rectangle.
+fn picked(f: &mut Frame, app: &App, term: Rect) {
+    let Some(((r1, c1), (r2, c2))) = app.picked_cells() else { return };
+    if (r1, c1) == (r2, c2) {
+        return; // a click, not a drag
+    }
+    let buf = f.buffer_mut();
+    for row in r1..=r2.min(term.height.saturating_sub(1)) {
+        let from = if row == r1 { c1 } else { 0 };
+        let to = if row == r2 { c2 } else { term.width.saturating_sub(1) };
+        for col in from..=to.min(term.width.saturating_sub(1)) {
+            buf[(term.x + col, term.y + row)].set_style(Style::new().add_modifier(Modifier::REVERSED));
+        }
+    }
+}
+
+/// A week of work at a glance: one row per day, one tile per hour, each tile shaded by how
+/// many tokens the agents produced in that hour. Empty hours stay dark.
+fn activity(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::bordered().title(" activity · tokens produced per hour ").border_style(DIM);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+    let days = (inner.height - 1).min(7) as u64;
+    let today = local_minute(now_secs() / 60) / 1440;
+    let first = today + 1 - days;
+    let mut grid = vec![[0u64; 24]; days as usize];
+    for s in &app.sessions {
+        for (&minute, &produced) in &s.usage.timeline {
+            let local = local_minute(minute);
+            if (first..=today).contains(&(local / 1440)) {
+                grid[(local / 1440 - first) as usize][(local % 1440 / 60) as usize] += produced;
+            }
+        }
+    }
+    let peak = grid.iter().flatten().copied().max().unwrap_or(0).max(1);
+    let shade = |t: u64| match t {
+        0 => Color::Rgb(0x26, 0x26, 0x2e),
+        // four steps, like a contribution graph: the lightest still reads against the empties
+        t => {
+            let step = (t * 4).div_ceil(peak).clamp(1, 4) as u8;
+            let f = |from: u8, to: u8| from + (to - from) / 4 * step;
+            Color::Rgb(f(0x4a, 0xff), f(0x3a, 0xc2), f(0x2a, 0x7a))
+        }
+    };
+    let mut lines: Vec<Line> = grid
+        .iter()
+        .enumerate()
+        .map(|(row, hours)| {
+            let day = first + row as u64;
+            let name = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][((day + 4) % 7) as usize];
+            let mut spans = vec![format!("{name} ").fg(DIM)];
+            spans.extend(hours.iter().map(|&t| Span::styled("██", Style::new().fg(shade(t)))));
+            spans.push(format!(" {}", tokens(hours.iter().sum())).fg(DIM));
+            Line::from(spans)
+        })
+        .collect();
+    let mut axis = vec![Span::raw("    ")];
+    axis.extend((0..24).step_by(6).map(|h| format!("{h:02}          ").fg(DIM)));
+    axis.push(" less ".fg(DIM));
+    axis.extend([1, peak / 3, peak * 2 / 3, peak].map(|t| Span::styled("█", Style::new().fg(shade(t)))));
+    axis.push(" more".fg(DIM));
+    lines.push(Line::from(axis));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn card(f: &mut Frame, s: &Session, selected: bool, r: Rect) {
@@ -522,6 +596,11 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     if waiting > 0 {
         spans.push(format!(" {waiting} need input ").black().on_magenta());
     }
+    match &app.update {
+        Some(Update::Ready(commit)) => spans.push(format!(" ⟳ {commit} installed · restart chud ").black().on_green()),
+        Some(Update::Failed(why)) => spans.push(format!(" ⟳ update failed: {why} ").black().on_red()),
+        None => {}
+    }
     f.render_widget(Line::from(spans).bg(BAR_BG), area);
 }
 
@@ -548,6 +627,7 @@ const HELP: &[(&str, &str)] = &[
     ("click", "select a session · … opens its menu · a group header folds it"),
     ("right-click", "a session or group header opens its menu"),
     ("drag", "a session onto another session or a group to move it"),
+    ("drag in the terminal", "select text; letting go copies it"),
     ("drag edge", "the sidebar's right edge to resize it"),
     ("toolbar", "+ New (terminal or group) · Dashboard · Diff · Help"),
     ("C-a n", "new terminal (zsh) in this group"),
@@ -559,7 +639,7 @@ const HELP: &[(&str, &str)] = &[
     ("C-a z", "fold / unfold this group"),
     ("C-a J / K", "move session down / up in its group"),
     ("C-a y", "copy what this session shows to the clipboard"),
-    ("C-a v", "select text with the mouse (⌘C copies); again to return"),
+    ("C-a v", "hand the mouse to the terminal (⌥ does it while held)"),
     ("C-a f", "zoom: hide or show the sidebar"),
     ("C-a d", "diff review (c commit, r discard, R refresh)"),
     ("C-a s", "summary dashboard"),

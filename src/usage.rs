@@ -10,6 +10,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub struct Usage {
     pub model: String,
     pub context: u64,
+    /// the model's real context window, when Claude Code has told us (see context_path)
+    pub window: u64,
     pub input: u64,
     pub cached: u64,
     pub output: u64,
@@ -42,6 +44,21 @@ pub fn log_path(copilot: bool, sid: &str, cwd: &Path) -> Option<PathBuf> {
     })
 }
 
+/// The same minute, in the clock on the wall here. Asked of the C library once: it knows the
+/// zone and whether daylight saving was on.
+pub fn local_minute(minute: u64) -> u64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let offset = *OFFSET.get_or_init(|| {
+        let t = now_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        match unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            true => 0,
+            false => tm.tm_gmtoff as i64 / 60,
+        }
+    });
+    minute.saturating_add_signed(offset)
+}
+
 /// Minutes since the Unix epoch for an RFC 3339 UTC timestamp ("2026-09-14T02:04:52.692Z").
 pub fn epoch_minute(ts: &str) -> Option<u64> {
     let n = |at: usize, len: usize| ts.get(at..at + len)?.parse::<i64>().ok();
@@ -55,14 +72,17 @@ pub fn epoch_minute(ts: &str) -> Option<u64> {
 }
 
 impl Usage {
-    /// Tokens the model accepts per request: what the progress bar measures against.
-    /// Copilot logs it; current Claude models take 1M except Haiku (200K).
+    /// The context window the bar measures against. Both agents report their real one — Claude
+    /// Code through its status line, Copilot as max_prompt_tokens in its log — and that is what
+    /// tells a 200K session from a 1M one. The guesses below only cover the moments before the
+    /// agent has said anything: its first reply replaces them.
     pub fn limit(&self) -> u64 {
-        match (self.prompt_limit, self.copilot) {
+        match (self.window.max(self.prompt_limit), self.copilot) {
             (n, _) if n > 0 => n,
-            (_, true) => 272_000,
-            _ if self.model.contains("haiku") => 200_000,
-            _ => 1_000_000,
+            (_, true) => 128_000,
+            // claude runs 200K unless the session opted into the 1M window ("sonnet[1m]")
+            _ if self.model.contains("[1m]") => 1_000_000,
+            _ => 200_000,
         }
     }
 
@@ -199,6 +219,21 @@ pub fn limits_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/chud/claude-limits.json")
 }
 
+/// Where it keeps that session's context window, one file per session id.
+pub fn context_path(sid: &str) -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(format!(".config/chud/context/{sid}.json"))
+}
+
+/// What Claude Code says is in this session's context window, which is the honest answer:
+/// it knows the model's real window and what the last request actually carried.
+/// `(tokens in the window, the window's size)`.
+pub fn claude_context(sid: &str) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(context_path(sid)).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let used = v["total_input_tokens"].as_u64()? + v["total_output_tokens"].as_u64().unwrap_or(0);
+    Some((used, v["context_window_size"].as_u64().unwrap_or(0)))
+}
+
 /// Claude's 5-hour and weekly windows from its status-line `rate_limits` object.
 pub fn claude_windows(v: &Value, now: u64) -> [Option<Window>; 2] {
     ["five_hour", "seven_day"].map(|k| -> Option<Window> {
@@ -257,7 +292,7 @@ mod tests {
         let mut u = Usage::default();
         u.refresh(&p, false);
         assert_eq!((u.input, u.cached, u.output, u.context), (220, 2000, 10, 1110));
-        assert_eq!((u.model.as_str(), u.limit()), ("claude-opus-5", 1_000_000));
+        assert_eq!((u.model.as_str(), u.limit()), ("claude-opus-5", 200_000));
         let m0 = epoch_minute("2026-09-14T10:00:00Z").unwrap();
         assert_eq!(u.timeline.get(&(m0 + 1)), Some(&7), "message a: its final count, once");
 
@@ -288,6 +323,19 @@ mod tests {
         assert!((u.credits - 135.47169).abs() < 1e-6);
         let m = epoch_minute("2026-09-14T10:01:00Z").unwrap();
         assert_eq!(u.timeline.get(&m), Some(&500));
+    }
+
+    /// The window comes from the agent; the guess only fills the gap before it speaks.
+    #[test]
+    fn context_window() {
+        let claude = |model: &str| Usage { model: model.into(), ..Default::default() };
+        assert_eq!(claude("claude-opus-5").limit(), 200_000, "claude code's default window");
+        assert_eq!(claude("claude-sonnet-5[1m]").limit(), 1_000_000, "opted into the long window");
+        let reported = Usage { window: 1_000_000, model: "claude-opus-5".into(), ..Default::default() };
+        assert_eq!(reported.limit(), 1_000_000, "what claude code reports wins over the guess");
+        let copilot = Usage { copilot: true, prompt_limit: 272_000, ..Default::default() };
+        assert_eq!(copilot.limit(), 272_000, "copilot logs max_prompt_tokens");
+        assert_eq!(Usage { copilot: true, ..Default::default() }.limit(), 128_000, "before it logs one");
     }
 
     #[test]

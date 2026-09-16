@@ -3,7 +3,8 @@
 # Re-run after any code change.
 set -e
 cd "$(dirname "$0")"
-cargo build --release --workspace
+# baked in so the running chud can tell when the repo it came from has moved on (src/update.rs)
+CHUD_REPO="$PWD" CHUD_COMMIT="$(git rev-parse HEAD 2>/dev/null)" cargo build --release --workspace
 
 APP="$HOME/Applications/chud.app"
 rm -rf "$APP"

@@ -1,5 +1,6 @@
 mod chud;
 mod git;
+mod update;
 mod session;
 mod ui;
 mod usage;
@@ -14,7 +15,7 @@ use ratatui::layout::Rect;
 use serde_json::{json, Value};
 use session::{Agent, Event, Session, Status};
 use std::io::{stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -203,14 +204,20 @@ struct App {
     hits: Vec<(Rect, Hit)>,
     drag: Option<Drag>,
     hover: Option<Hit>,
-    /// mouse reporting off so the terminal can select text (C-a v)
+    /// mouse reporting off so the terminal can select text (C-a v, or holding ⌥)
     select: bool,
+    /// C-a v turned it on, so releasing ⌥ must not turn it off again
+    select_sticky: bool,
+    /// dragging over the terminal selects its text: (anchor, cursor), both screen cells
+    picked: Option<((u16, u16), (u16, u16))>,
     /// sidebar width parked here while the terminal is zoomed (C-a f)
     zoom: Option<u16>,
     /// the window changed size: repaint every cell, not just the ones that differ
     resized: bool,
     /// one line of feedback in the status bar, until the next key
     flash: Option<String>,
+    /// a rebuilt chud is installed and waiting for a restart
+    update: Option<update::Update>,
     last_usage: Instant,
     plan: usage::Plan,
     tx: mpsc::Sender<Event>,
@@ -271,9 +278,12 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         drag: None,
         hover: None,
         select: false,
+        select_sticky: false,
+        picked: None,
         zoom: None,
         resized: false,
         flash: None,
+        update: None,
         last_usage: Instant::now(),
         plan: usage::Plan::default(),
         tx,
@@ -300,6 +310,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         app.open(DEFAULT_CMD); // like any terminal app: start with a shell
     }
     app.refresh_plan();
+    update::watch(app.tx.clone());
 
     let mut hits = vec![];
     term.draw(|f| hits = ui::draw(f, &app))?;
@@ -325,7 +336,12 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         }
         if dirty {
             if std::mem::take(&mut app.resized) {
-                term.clear()?;
+                // Not Terminal::clear(): that asks the terminal where the cursor is, and the
+                // reply goes to the thread reading input, so it times out and takes chud down
+                // with it. Wipe the screen, then blank what ratatui believes is on it with one
+                // throwaway frame, so the real frame after it draws every cell.
+                execute!(stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+                term.draw(|f| f.render_widget(ratatui::widgets::Clear, f.area()))?;
             }
             let wait = FRAME.saturating_sub(last.elapsed());
             if !wait.is_zero() {
@@ -370,6 +386,13 @@ impl App {
             }
             Event::Copilot(quota) => {
                 self.plan.copilot = quota;
+                true
+            }
+            Event::Updated(u) => {
+                if let update::Update::Ready(commit) = &u {
+                    notify("chud updated", &format!("{commit} is installed · quit and start chud again"));
+                }
+                self.update = Some(u);
                 true
             }
         }
@@ -479,6 +502,14 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        // chud.app sends F17/F16 as ⌥ goes down and up, and a real keyboard never does: while the
+        // key is held the terminal gets the mouse, so ⌥-drag selects text the way it does in
+        // every other terminal. C-a v is the same thing, latched.
+        match k.code {
+            KeyCode::F(17) => return self.set_select(true),
+            KeyCode::F(16) => return self.set_select(self.select_sticky),
+            _ => {}
+        }
         if self.help || self.menu.is_some() {
             (self.help, self.menu) = (false, None);
             return;
@@ -532,7 +563,10 @@ impl App {
                 }
             }
             KeyCode::Tab => self.next_waiting(),
-            KeyCode::Char('v') => self.toggle_select(),
+            KeyCode::Char('v') => {
+                self.set_select(!self.select);
+                self.select_sticky = self.select;
+            }
             KeyCode::Char('y') if has => self.copy_screen(),
             KeyCode::Char('f') => {
                 match self.zoom.take() {
@@ -566,8 +600,11 @@ impl App {
     /// Selecting text with the mouse is the terminal's job, but it only gets the chance while
     /// nothing is reporting the mouse: until then every drag comes here instead. So hand the
     /// mouse back for as long as you're selecting, then take it again.
-    fn toggle_select(&mut self) {
-        self.select = !self.select;
+    fn set_select(&mut self, on: bool) {
+        if self.select == on {
+            return;
+        }
+        self.select = on;
         self.drag = None;
         let _ = if self.select {
             execute!(stdout(), ct::DisableMouseCapture)
@@ -755,6 +792,7 @@ impl App {
     }
 
     fn select(&mut self, i: usize) {
+        self.picked = None; // a selection belongs to the session it was made in
         self.sel = i;
         self.diff = None;
         self.dash = false;
@@ -1102,6 +1140,9 @@ impl App {
             Some(Hit::DiffAct(a)) => self.diff_act(a),
             Some(Hit::Card(i)) => self.select(i),
             Some(Hit::Pane) => {
+                // where a selection would start; a press that never moves is just a click,
+                // and the agent gets it either way
+                self.picked = Some(((m.column, m.row), (m.column, m.row)));
                 self.drag = Some(Drag { from: Hit::Pane, at: (m.column, m.row), moved: false });
                 self.to_pane(m);
             }
@@ -1115,7 +1156,11 @@ impl App {
         match d.from {
             _ if !d.moved => {}
             Hit::Edge => self.side = (m.column + 1).clamp(24, (self.size.0 / 2).max(24)),
-            Hit::Pane => self.to_pane(m),
+            // dragging over the terminal selects its text rather than reaching the agent
+            Hit::Pane => match &mut self.picked {
+                Some((_, to)) => *to = (m.column, m.row),
+                None => self.to_pane(m),
+            },
             _ => self.hover = hit,
         }
     }
@@ -1133,9 +1178,38 @@ impl App {
                 }
                 self.save();
             }
-            Hit::Pane => self.to_pane(m),
+            Hit::Pane if d.moved => self.copy_picked(),
+            Hit::Pane => {
+                self.picked = None;
+                self.to_pane(m);
+            }
             _ => {}
         }
+    }
+
+    /// What the drag covered, in the agent's own screen coordinates, ordered from the earlier
+    /// cell to the later one.
+    fn picked_cells(&self) -> Option<((u16, u16), (u16, u16))> {
+        let (anchor, to) = self.picked?;
+        let pane = self.hits.iter().find(|(_, h)| *h == Hit::Pane)?.0;
+        let cell = |(x, y): (u16, u16)| {
+            (y.clamp(pane.y, pane.bottom() - 1) - pane.y, x.clamp(pane.x, pane.right() - 1) - pane.x)
+        };
+        let (a, b) = (cell(anchor), cell(to));
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// Copies the dragged-over text. The selection stays lit so you can see what you got.
+    fn copy_picked(&mut self) {
+        let (Some(((r1, c1), (r2, c2))), Some(s)) = (self.picked_cells(), self.sessions.get(self.sel)) else {
+            return;
+        };
+        let text = s.parser.lock().unwrap().screen().contents_between(r1, c1, r2, c2 + 1);
+        self.flash = match (text.is_empty(), pbcopy(&text)) {
+            (true, _) => None,
+            (_, Ok(())) => Some(format!(" copied {} characters to the clipboard ", text.chars().count())),
+            (_, Err(e)) => Some(format!(" could not copy: {e} ")),
+        };
     }
 
     /// Forwards a mouse event to the agent in the pane, or scrolls our scrollback if it
@@ -1167,13 +1241,13 @@ fn statusline() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let v: Value = serde_json::from_str(&input).unwrap_or_default();
+    // this session's context window, for the bar chud draws beside the session
+    if let (Some(sid), true) = (v["session_id"].as_str(), v["context_window"].is_object()) {
+        save(&usage::context_path(sid), &v["context_window"].to_string());
+    }
     let path = usage::limits_path();
     let limits = if v["rate_limits"].is_object() {
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id())); // sessions run this at once
-        if std::fs::write(&tmp, v["rate_limits"].to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        save(&path, &v["rate_limits"].to_string());
         v["rate_limits"].clone()
     } else {
         // not sent yet this session (it comes with the first reply): show the last known
@@ -1186,6 +1260,16 @@ fn statusline() -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Writes a file the way a status line must: in one step, since every Claude session in the
+/// house runs this at once.
+fn save(path: &Path, text: &str) {
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(path));
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 fn pbcopy(text: &str) -> std::io::Result<()> {

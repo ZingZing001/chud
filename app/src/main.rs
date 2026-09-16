@@ -69,10 +69,13 @@ enum Message {
     FontSize(f32),
     /// a ⌘ shortcut, as the keys chud would have seen
     Send(Vec<u8>),
+    /// ⌥ went down or up
+    Alt(bool),
 }
 
 struct App {
     term: iced_term::Terminal,
+    alt: bool, // ⌥ held: chud hands the mouse to us so a drag selects text
     cursor: Point,
     scroll_px: f32, // trackpad scrolling not yet worth a whole line
     font_size: f32,
@@ -131,7 +134,8 @@ impl App {
             Err(_) => Task::none(),
         };
         let focus = TerminalView::focus(term.widget_id().clone());
-        let app = Self { term, cursor: Point::ORIGIN, scroll_px: 0.0, font_size: FONT_SIZE, size: Size::ZERO };
+        let app =
+            Self { term, alt: false, cursor: Point::ORIGIN, scroll_px: 0.0, font_size: FONT_SIZE, size: Size::ZERO };
         (app, Task::batch([focus, symbols]))
     }
 
@@ -174,6 +178,12 @@ impl App {
             Message::Send(bytes) => {
                 self.term.handle(write(bytes));
             }
+            // F17 / F16: keys no keyboard sends, so chud can read them as "⌥ is down / up" and
+            // stop reporting the mouse while it is, leaving the drag to us as a selection.
+            Message::Alt(down) if down != self.alt => {
+                self.alt = down;
+                self.term.handle(write(if down { b"\x1b[34~" } else { b"\x1b[33~" }.to_vec()));
+            }
             // iced_term only re-measures when an input event reaches it, so a window that settles
             // its size after start-up would keep a tiny terminal until you touched it. Push the
             // size ourselves: the font first (sets the cell size), then the layout.
@@ -181,6 +191,7 @@ impl App {
                 self.size = size;
                 self.relayout();
             }
+            Message::Alt(_) => {} // ⌘ or ⇧ changing while ⌥ stayed put
             Message::Cursor(position) => self.cursor = position,
             // iced_term passes on only the left button; send right-clicks to chud ourselves,
             // as a press and release in SGR mouse encoding at the cell under the pointer
@@ -238,6 +249,7 @@ impl App {
             Event::Window(window::Event::Opened { size, .. } | window::Event::Resized(size)) => {
                 Some(Message::Resized(size))
             }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Message::Alt(m.alt())),
             Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::Cursor(position)),
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => Some(Message::RightClick),
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(Message::Wheel(delta)),

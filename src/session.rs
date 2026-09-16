@@ -22,6 +22,8 @@ pub enum Event {
     Exited(usize),
     /// Copilot's monthly premium-request quota, fetched from GitHub in the background
     Copilot(Option<(usage::Window, u64)>),
+    /// a newer chud was pulled and built, or the attempt failed
+    Updated(crate::update::Update),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -380,6 +382,12 @@ impl Session {
             .unwrap_or_else(|| self.cwd.clone());
         if let Some(path) = usage::log_path(copilot, &sid, &cwd) {
             self.usage.refresh(&path, copilot);
+        }
+        // Claude Code itself reports what its context holds and how big the window is, which
+        // beats adding up the transcript against a guessed window (see usage::claude_context).
+        if let Some((used, window)) = (!copilot).then(|| usage::claude_context(&sid)).flatten() {
+            self.usage.context = used;
+            self.usage.window = window;
         }
     }
 
