@@ -122,22 +122,33 @@ pub fn lines(px: &Pixels) -> Vec<Line<'static>> {
 }
 
 /// A `width`-cell progress bar with eighth-cell precision: green, amber past 60%, red past 85%.
-pub fn bar(ratio: f64, width: usize) -> Span<'static> {
+/// A progress bar whose fill runs green → amber → red across its own length, so how full it is
+/// reads from the colour as well as the length. One span per cell; the empty part is one more.
+pub fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
+    const TRACK: Color = Color::Rgb(0x33, 0x33, 0x3a);
+    const STOPS: [(u8, u8, u8); 3] = [(0x8b, 0xd4, 0x7a), (0xf5, 0xc1, 0x5a), (0xf2, 0x6d, 0x6d)];
     let r = ratio.clamp(0.0, 1.0);
-    let color = match r {
-        r if r >= 0.85 => Color::Rgb(0xf2, 0x6d, 0x6d),
-        r if r >= 0.6 => Color::Rgb(0xf5, 0xc1, 0x5a),
-        _ => Color::Rgb(0x8b, 0xd4, 0x7a),
-    };
     let eighths = (r * width as f64 * 8.0).round() as usize;
     let (full, part) = (eighths / 8, eighths % 8);
-    let mut s = "█".repeat(full.min(width));
+    let colour = |cell: usize| {
+        // where this cell sits along the bar, mixed between the two stops it falls between
+        let t = if width > 1 { cell as f64 / (width - 1) as f64 * 2.0 } else { 0.0 };
+        let (a, b, f) = (STOPS[t as usize % 3], STOPS[(t as usize + 1).min(2)], t.fract());
+        let mix = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * f).round() as u8;
+        Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+    };
+    let mut spans: Vec<Span<'static>> = (0..full.min(width))
+        .map(|i| Span::styled("█", Style::new().fg(colour(i)).bg(TRACK)))
+        .collect();
     if part > 0 && full < width {
-        s.push([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'][part]);
+        let tip = [' ', '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}'][part];
+        spans.push(Span::styled(tip.to_string(), Style::new().fg(colour(full)).bg(TRACK)));
     }
-    let used = s.chars().count();
-    s.push_str(&" ".repeat(width - used));
-    Span::styled(s, Style::new().fg(color).bg(Color::Rgb(0x33, 0x33, 0x3a)))
+    let empty = width - spans.len();
+    if empty > 0 {
+        spans.push(Span::styled(" ".repeat(empty), Style::new().bg(TRACK)));
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -176,12 +187,14 @@ mod tests {
 
     #[test]
     fn progress_bar() {
-        let text = |r, w| bar(r, w).content.to_string();
+        let text = |r, w| bar(r, w).iter().map(|s| s.content.as_ref()).collect::<String>();
         assert_eq!(text(0.0, 4), "    ");
         assert_eq!(text(0.5, 4), "██  ");
         assert_eq!(text(1.0, 4), "████");
         assert_eq!(text(0.53, 4), "██▏ ");
         assert_eq!(text(3.0, 4), "████", "clamped");
+        let colours: Vec<_> = bar(1.0, 4).iter().map(|s| s.style.fg).collect();
+        assert_eq!(colours.iter().collect::<std::collections::HashSet<_>>().len(), 4, "each cell its own colour");
     }
 
     // `cargo test preview -- --nocapture` prints every sprite, for eyeballing the art

@@ -203,6 +203,14 @@ struct App {
     hits: Vec<(Rect, Hit)>,
     drag: Option<Drag>,
     hover: Option<Hit>,
+    /// mouse reporting off so the terminal can select text (C-a v)
+    select: bool,
+    /// sidebar width parked here while the terminal is zoomed (C-a f)
+    zoom: Option<u16>,
+    /// the window changed size: repaint every cell, not just the ones that differ
+    resized: bool,
+    /// one line of feedback in the status bar, until the next key
+    flash: Option<String>,
     last_usage: Instant,
     plan: usage::Plan,
     tx: mpsc::Sender<Event>,
@@ -262,6 +270,10 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         hits: vec![],
         drag: None,
         hover: None,
+        select: false,
+        zoom: None,
+        resized: false,
+        flash: None,
         last_usage: Instant::now(),
         plan: usage::Plan::default(),
         tx,
@@ -296,7 +308,8 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     loop {
         // Block until something happens (idle = no wakeups); while something is animating or
         // timing, wake once a second. Then drain and draw once.
-        let ticking = app.dash || app.sessions.iter().any(|s| s.working_since.is_some());
+        let ticking = app.dash
+            || app.sessions.iter().any(|s| s.working_since.is_some() || s.status() == Status::NeedsInput);
         let first = if ticking { rx.recv_timeout(TICK).ok() } else { Some(rx.recv()?) };
         let mut dirty = first.is_some_and(|e| app.handle(e));
         while let Ok(e) = rx.try_recv() {
@@ -311,6 +324,9 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
             dirty = true;
         }
         if dirty {
+            if std::mem::take(&mut app.resized) {
+                term.clear()?;
+            }
             let wait = FRAME.saturating_sub(last.elapsed());
             if !wait.is_zero() {
                 std::thread::sleep(wait);
@@ -433,6 +449,11 @@ impl App {
     fn input(&mut self, e: Input) {
         match e {
             Input::Resize(w, h) => {
+                // ratatui only clears the screen when the width shrinks, so after growing (going
+                // full screen, say) it still believes the old frame is on display and repaints
+                // only the cells that differ from it. Whatever the terminal did with the old
+                // frame then shows through. Start from a clean screen instead.
+                self.resized = true;
                 self.size = (w, h);
                 let size = self.pane();
                 for s in &self.sessions {
@@ -465,6 +486,7 @@ impl App {
         if self.prompt.is_some() {
             return self.prompt_key(k);
         }
+        self.flash = None; // it says what the last key did; this one gets to speak for itself
         let ctrl_a = k.code == KeyCode::Char('a') && k.modifiers.contains(KeyModifiers::CONTROL);
         if self.prefix {
             self.prefix = false;
@@ -510,6 +532,15 @@ impl App {
                 }
             }
             KeyCode::Tab => self.next_waiting(),
+            KeyCode::Char('v') => self.toggle_select(),
+            KeyCode::Char('y') if has => self.copy_screen(),
+            KeyCode::Char('f') => {
+                match self.zoom.take() {
+                    Some(width) => self.side = width,
+                    None => self.zoom = Some(std::mem::replace(&mut self.side, 0)),
+                }
+                self.save();
+            }
             KeyCode::Char('d') => self.tool(Tool::Diff),
             KeyCode::Char('s') => self.tool(Tool::Dash),
             KeyCode::Char('?') => self.tool(Tool::Help),
@@ -530,6 +561,31 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
+    }
+
+    /// Selecting text with the mouse is the terminal's job, but it only gets the chance while
+    /// nothing is reporting the mouse: until then every drag comes here instead. So hand the
+    /// mouse back for as long as you're selecting, then take it again.
+    fn toggle_select(&mut self) {
+        self.select = !self.select;
+        self.drag = None;
+        let _ = if self.select {
+            execute!(stdout(), ct::DisableMouseCapture)
+        } else {
+            execute!(stdout(), ct::EnableMouseCapture)
+        };
+    }
+
+    /// Copy what the session shows to the clipboard, for when reaching for the mouse (C-a v)
+    /// is the slower way to get at it.
+    fn copy_screen(&mut self) {
+        let Some(s) = self.sessions.get(self.sel) else { return };
+        let text = s.parser.lock().unwrap().screen().contents();
+        let lines = text.lines().count();
+        self.flash = match pbcopy(&text) {
+            Ok(()) => Some(format!(" copied {lines} lines to the clipboard ")),
+            Err(e) => Some(format!(" could not copy: {e} ")),
+        };
     }
 
     fn tool(&mut self, t: Tool) {
@@ -820,7 +876,7 @@ impl App {
             .collect();
         let path = state_path();
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let state = json!({ "side": self.side, "groups": groups, "sessions": sessions });
+        let state = json!({ "side": self.zoom.unwrap_or(self.side), "groups": groups, "sessions": sessions });
         let _ = std::fs::write(&path, state.to_string());
     }
 
@@ -1129,6 +1185,13 @@ fn statusline() -> Result<()> {
         [Some(h), None] => println!("5h {h}"),
         _ => {}
     }
+    Ok(())
+}
+
+fn pbcopy(text: &str) -> std::io::Result<()> {
+    let mut child = Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn()?;
+    child.stdin.take().expect("piped").write_all(text.as_bytes())?;
+    child.wait()?;
     Ok(())
 }
 

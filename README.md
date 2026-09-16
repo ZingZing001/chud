@@ -19,6 +19,7 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 | **Groups** | Put sessions in named, foldable groups; drag sessions to reorder or regroup them. |
 | **Dashboard** | Summary page with token charts, working time, and every agent's chud. |
 | **Diff review** | See the repo's changed files, then commit or discard without leaving chud. |
+| **Copy anything** | `C-a v` hands the mouse to the terminal so you can drag-select and ⌘C; `C-a y` copies the whole session view without the mouse. |
 | **Mouse-first UI** | Toolbar, `…` and right-click menus, drag and drop, resizable sidebar. Every action also has a keyboard shortcut. |
 | **Restore on restart** | Layout, groups, names and agent chats come back the next time you run `chud`. |
 | **Fast & idle-friendly** | Draws only when something changes; release builds use fat LTO. |
@@ -95,11 +96,16 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a g` / `G` | Move session to a group / rename its group |
 | `C-a z` | Fold / unfold this group |
 | `C-a J` / `K` | Move session down / up |
+| `C-a y` | Copy what this session shows to the clipboard |
+| `C-a v` | Select text with the mouse (⌘C copies); again to return |
+| `C-a f` | Zoom: hide or show the sidebar |
 | `C-a d` | Diff review (`c` commit, `r` discard, `R` refresh) |
 | `C-a s` | Dashboard |
 | `C-a x` | Kill session |
 | `C-a q` | Quit (running `chud` again restores everything) |
 | `C-a C-a` | Send a literal `Ctrl-a` |
+
+In chud.app the usual ⌘ shortcuts work too: ⌘T new session, ⌘W kill it, ⌘1–⌘9 to jump, ⌘+/⌘−/⌘0 for text size, and ⌘V paste.
 
 `C-a ?` or the **Help** button shows this list in the app. chud keeps its state in `~/.config/chud/`.
 

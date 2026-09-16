@@ -45,7 +45,8 @@ fn badge(s: Status) -> Span<'static> {
     match s {
         Status::Idle => "○ ".dark_gray(),
         Status::Working => "● ".yellow(),
-        Status::NeedsInput => "◐ ".magenta().bold(),
+        Status::NeedsInput if now_secs() % 2 == 0 => "◐ ".magenta().bold(),
+        Status::NeedsInput => "◑ ".light_magenta().bold(),
         Status::Done => "✓ ".green(),
         Status::Exited => "✗ ".red(),
     }
@@ -181,22 +182,20 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect) {
             let bar = |w: Window| chud::bar(w.used / 100.0, (area.width / 5).clamp(10, 30) as usize);
             match (claude, plan.five_hour, plan.copilot) {
                 (true, Some(h), _) => {
-                    spans.extend([
-                        Span::raw("5h limit "),
-                        bar(h),
-                        format!(" {:.0}%", h.used).into(),
-                        format!("  resets in {}", until(h.resets_at)).fg(DIM),
-                    ]);
+                    spans.push(Span::raw("5h limit "));
+                    spans.extend(bar(h));
+                    spans.push(format!(" {:.0}%", h.used).into());
+                    spans.push(format!("  resets in {}", until(h.resets_at)).fg(DIM));
                     if let Some(w) = plan.seven_day {
                         spans.push(format!(" · week {:.0}%", w.used).fg(DIM));
                     }
                 }
-                (false, _, Some((q, total))) => spans.extend([
-                    Span::raw("premium requests "),
-                    bar(q),
-                    format!(" {:.0}% of {total}", q.used).into(),
-                    format!("  resets in {}", until(q.resets_at)).fg(DIM),
-                ]),
+                (false, _, Some((q, total))) => {
+                    spans.push(Span::raw("premium requests "));
+                    spans.extend(bar(q));
+                    spans.push(format!(" {:.0}% of {total}", q.used).into());
+                    spans.push(format!("  resets in {}", until(q.resets_at)).fg(DIM));
+                }
                 (true, None, _) => spans.push("5h limit shows after Claude's next reply".fg(DIM)),
                 (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(DIM)),
             }
@@ -331,7 +330,7 @@ fn session_item(s: &Session, num: usize, headers: bool) -> ListItem<'static> {
     };
     let mut second = vec![Span::raw(format!("{pad}    "))];
     if is_agent(s) {
-        second.push(chud::bar(fullness(s), 8));
+        second.extend(chud::bar(fullness(s), 8));
         second.push(format!(" {:>3.0}% ", fullness(s) * 100.0).fg(DIM));
     } else {
         second.push(format!("{} · ", s.folder()).fg(DIM));
@@ -439,8 +438,9 @@ fn card(f: &mut Frame, s: &Session, selected: bool, r: Rect) {
     lines.push(Line::from(name.bold()).centered());
     if is_agent(s) {
         let p = fullness(s);
-        let bar = chud::bar(p, inner.width.saturating_sub(6) as usize);
-        lines.push(Line::from(vec![bar, format!(" {:>3.0}%", p * 100.0).into()]).centered());
+        let mut bar = chud::bar(p, inner.width.saturating_sub(6) as usize);
+        bar.push(format!(" {:>3.0}%", p * 100.0).into());
+        lines.push(Line::from(bar).centered());
     } else {
         lines.push(Line::from(s.folder().fg(DIM)).centered());
     }
@@ -504,12 +504,17 @@ fn diff(f: &mut Frame, d: &Diff, area: Rect, hits: &mut Hits) {
 }
 
 fn status_bar(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(flash) = &app.flash {
+        f.render_widget(Line::from(flash.as_str().black().on_green()).bg(BAR_BG), area);
+        return;
+    }
     let keys = match &app.drag {
+        _ if app.select => " selecting text: drag to select · ⌘C copies · C-a v gives the mouse back to chud ",
         Some(Drag { from: Hit::Session(_), moved: true, .. }) => " drop onto a session or a group to move it there ",
         Some(Drag { from: Hit::Edge, .. }) => " drag to resize the sidebar ",
         _ if app.diff.is_some() => " diff: j/k file · J/K scroll · c commit all · r discard file · R refresh · Esc close ",
         _ if app.dash => " summary: click a card to open that session · scroll for more · Esc close ",
-        _ if app.prefix => " n new · r rename · g group · z fold · s dashboard · d diff · x kill · q quit · ? help ",
+        _ if app.prefix => " n new · r rename · g group · z fold · f zoom · y copy · s dashboard · d diff · x kill · q quit · ? help ",
         _ => " C-a ? help · click, drag and scroll with the mouse ",
     };
     let mut spans = vec![if app.prefix { keys.black().on_yellow() } else { keys.into() }];
@@ -553,6 +558,9 @@ const HELP: &[(&str, &str)] = &[
     ("C-a G", "rename this session's group"),
     ("C-a z", "fold / unfold this group"),
     ("C-a J / K", "move session down / up in its group"),
+    ("C-a y", "copy what this session shows to the clipboard"),
+    ("C-a v", "select text with the mouse (⌘C copies); again to return"),
+    ("C-a f", "zoom: hide or show the sidebar"),
     ("C-a d", "diff review (c commit, r discard, R refresh)"),
     ("C-a s", "summary dashboard"),
     ("C-a x", "kill session"),

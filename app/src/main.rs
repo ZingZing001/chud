@@ -28,15 +28,17 @@ fn main() -> iced::Result {
         .run()
 }
 
-fn font() -> FontSettings {
+const FONT_SIZE: f32 = 13.0;
+
+fn font(size: f32) -> FontSettings {
     // line height = Fira Code's full-block height (2400/1950 em), so ▀▄█ tile with no gaps
-    FontSettings { size: 13.0, scale_factor: 1.231, font_type: Font::with_name("FiraCode Nerd Font") }
+    FontSettings { size, scale_factor: 1.231, font_type: Font::with_name("FiraCode Nerd Font") }
 }
 
 /// One terminal cell in window pixels, measured the way iced_term does (its font.rs), which
 /// then rounds down to whole pixels.
-fn cell_size() -> Size {
-    let f = font();
+fn cell_size(font_size: f32) -> Size {
+    let f = font(font_size);
     let m = iced_graphics::text::paragraph::Paragraph::with_text(Text {
         content: "m",
         font: f.font_type,
@@ -63,12 +65,18 @@ enum Message {
     Cursor(Point),
     RightClick,
     Wheel(mouse::ScrollDelta),
+    /// bigger / smaller text; 0.0 back to the default
+    FontSize(f32),
+    /// a ⌘ shortcut, as the keys chud would have seen
+    Send(Vec<u8>),
 }
 
 struct App {
     term: iced_term::Terminal,
     cursor: Point,
     scroll_px: f32, // trackpad scrolling not yet worth a whole line
+    font_size: f32,
+    size: Size, // the window's, so a font change can re-flow the terminal to it
 }
 
 impl App {
@@ -83,7 +91,7 @@ impl App {
         let env = [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "chud-app")]
             .map(|(k, v)| (k.to_string(), v.to_string()));
         let settings = Settings {
-            font: font(),
+            font: font(FONT_SIZE),
             backend: BackendSettings {
                 program: shell,
                 args,
@@ -94,21 +102,28 @@ impl App {
         };
         let mut term = iced_term::Terminal::new(0, settings).expect("could not start chud's terminal");
 
-        // Paste is handled in update(): the built-in paste sends the text raw, which would
-        // submit a multi-line paste to the agent line by line. The keys are bound to "write
-        // nothing" so they're swallowed: with no binding (Ignore) iced_term types the "v".
-        // COMMAND is Cmd on macOS and Ctrl on Windows/Linux; the Shift variant is covered too.
-        let paste_keys = [keyboard::Modifiers::COMMAND, keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT]
-            .map(|modifiers| {
-                let key = Binding {
-                    target: InputKind::Char("v".into()),
-                    modifiers,
-                    terminal_mode_include: TermMode::empty(),
-                    terminal_mode_exclude: TermMode::empty(),
-                };
-                (key, BindingAction::Esc(String::new()))
-            });
-        term.handle(Command::AddBindings(paste_keys.into()));
+        // The ⌘ shortcuts below are all handled in update(); here they're bound to "write
+        // nothing" so iced_term swallows them. Without a binding it types the bare character
+        // instead (Ignore falls through to the key's text), which is the old Cmd+V "v" bug.
+        // COMMAND is Cmd on macOS and Ctrl on Windows/Linux; the Shift variants are covered too.
+        let keys: Vec<String> = "v=+-_0123456789tw".chars().map(String::from).collect();
+        let swallow: Vec<_> = keys
+            .iter()
+            .flat_map(|c| {
+                [keyboard::Modifiers::COMMAND, keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT].map(
+                    |modifiers| {
+                        let key = Binding {
+                            target: InputKind::Char(c.clone()),
+                            modifiers,
+                            terminal_mode_include: TermMode::empty(),
+                            terminal_mode_exclude: TermMode::empty(),
+                        };
+                        (key, BindingAction::Esc(String::new()))
+                    },
+                )
+            })
+            .collect();
+        term.handle(Command::AddBindings(swallow));
 
         // Apple's symbol font covers ⎿ ⎯ ⧉; it can't be bundled, so load it from the system.
         let symbols = match std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
@@ -116,7 +131,14 @@ impl App {
             Err(_) => Task::none(),
         };
         let focus = TerminalView::focus(term.widget_id().clone());
-        (Self { term, cursor: Point::ORIGIN, scroll_px: 0.0 }, Task::batch([focus, symbols]))
+        let app = Self { term, cursor: Point::ORIGIN, scroll_px: 0.0, font_size: FONT_SIZE, size: Size::ZERO };
+        (app, Task::batch([focus, symbols]))
+    }
+
+    /// Re-measure at the current font size and re-flow the terminal to the window.
+    fn relayout(&mut self) {
+        self.term.handle(Command::ChangeFont(font(self.font_size)));
+        self.term.handle(Command::ProxyToBackend(BackendCommand::Resize(Some(self.size), None)));
     }
 
     /// The 1-based terminal cell under the pointer.
@@ -143,26 +165,33 @@ impl App {
                 self.term.handle(write(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec()));
             }
             Message::FontLoaded => {
-                self.term.handle(Command::ChangeFont(font())); // redraw with the new fallback
+                self.term.handle(Command::ChangeFont(font(self.font_size))); // redraw with the fallback
+            }
+            Message::FontSize(step) => {
+                self.font_size = if step == 0.0 { FONT_SIZE } else { (self.font_size + step).clamp(8.0, 32.0) };
+                self.relayout();
+            }
+            Message::Send(bytes) => {
+                self.term.handle(write(bytes));
             }
             // iced_term only re-measures when an input event reaches it, so a window that settles
             // its size after start-up would keep a tiny terminal until you touched it. Push the
             // size ourselves: the font first (sets the cell size), then the layout.
             Message::Resized(size) => {
-                self.term.handle(Command::ChangeFont(font()));
-                self.term.handle(Command::ProxyToBackend(BackendCommand::Resize(Some(size), None)));
+                self.size = size;
+                self.relayout();
             }
             Message::Cursor(position) => self.cursor = position,
             // iced_term passes on only the left button; send right-clicks to chud ourselves,
             // as a press and release in SGR mouse encoding at the cell under the pointer
             Message::RightClick => {
-                let (col, row) = self.cell_at(cell_size());
+                let (col, row) = self.cell_at(cell_size(self.font_size));
                 self.term.handle(write(format!("\x1b[<2;{col};{row}M\x1b[<2;{col};{row}m").into_bytes()));
             }
             // iced_term never reports the wheel (it scrolls, or types arrow keys in full-screen
             // apps); send chud real wheel reports instead, counted in lines like iced_term does
             Message::Wheel(delta) => {
-                let cell = cell_size();
+                let cell = cell_size(self.font_size);
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => y.round() as i32,
                     mouse::ScrollDelta::Pixels { y, .. } => {
@@ -189,10 +218,22 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         let window_events = event::listen_with(|event, _status, _window| match event {
+            // ⌘ shortcuts, the ones a terminal app is expected to have. chud's own commands all
+            // start with Ctrl-a, so a shortcut is just those keystrokes sent on your behalf.
             Event::Keyboard(keyboard::Event::KeyPressed { key: Key::Character(c), modifiers, .. })
-                if modifiers.command() && c.eq_ignore_ascii_case("v") =>
+                if modifiers.command() =>
             {
-                Some(Message::Paste)
+                let prefixed = |k: u8| Some(Message::Send(vec![0x01, k]));
+                match c.as_str() {
+                    "v" | "V" => Some(Message::Paste),
+                    "=" | "+" => Some(Message::FontSize(1.0)),
+                    "-" | "_" => Some(Message::FontSize(-1.0)),
+                    "0" => Some(Message::FontSize(0.0)),
+                    "t" | "T" => prefixed(b'n'), // new terminal session
+                    "w" | "W" => prefixed(b'x'), // kill this one (chud asks first)
+                    d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => prefixed(d.as_bytes()[0]),
+                    _ => None,
+                }
             }
             Event::Window(window::Event::Opened { size, .. } | window::Event::Resized(size)) => {
                 Some(Message::Resized(size))
