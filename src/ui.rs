@@ -436,9 +436,6 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
 /// cell to the last in reading order, not as a rectangle.
 fn picked(f: &mut Frame, app: &App, term: Rect) {
     let Some(((r1, c1), (r2, c2))) = app.picked_cells() else { return };
-    if (r1, c1) == (r2, c2) {
-        return; // a click, not a drag
-    }
     let buf = f.buffer_mut();
     for row in r1..=r2.min(term.height.saturating_sub(1)) {
         let from = if row == r1 { c1 } else { 0 };
@@ -639,7 +636,8 @@ const HELP: &[(&str, &str)] = &[
     ("C-a z", "fold / unfold this group"),
     ("C-a J / K", "move session down / up in its group"),
     ("C-a y", "copy what this session shows to the clipboard"),
-    ("C-a v", "hand the mouse to the terminal (⌥ does it while held)"),
+    ("⌘C / ⌘V", "copy what you selected · paste"),
+    ("C-a v", "hand the mouse to the terminal, to select outside the pane"),
     ("C-a f", "zoom: hide or show the sidebar"),
     ("C-a d", "diff review (c commit, r discard, R refresh)"),
     ("C-a s", "summary dashboard"),

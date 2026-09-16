@@ -206,8 +206,6 @@ struct App {
     hover: Option<Hit>,
     /// mouse reporting off so the terminal can select text (C-a v, or holding ⌥)
     select: bool,
-    /// C-a v turned it on, so releasing ⌥ must not turn it off again
-    select_sticky: bool,
     /// dragging over the terminal selects its text: (anchor, cursor), both screen cells
     picked: Option<((u16, u16), (u16, u16))>,
     /// sidebar width parked here while the terminal is zoomed (C-a f)
@@ -278,7 +276,6 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         drag: None,
         hover: None,
         select: false,
-        select_sticky: false,
         picked: None,
         zoom: None,
         resized: false,
@@ -502,13 +499,9 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
-        // chud.app sends F17/F16 as ⌥ goes down and up, and a real keyboard never does: while the
-        // key is held the terminal gets the mouse, so ⌥-drag selects text the way it does in
-        // every other terminal. C-a v is the same thing, latched.
-        match k.code {
-            KeyCode::F(17) => return self.set_select(true),
-            KeyCode::F(16) => return self.set_select(self.select_sticky),
-            _ => {}
+        // chud.app sends F15 for ⌘C, a key no keyboard sends: copy what the mouse selected.
+        if k.code == KeyCode::F(15) {
+            return self.copy_picked();
         }
         if self.help || self.menu.is_some() {
             (self.help, self.menu) = (false, None);
@@ -563,10 +556,7 @@ impl App {
                 }
             }
             KeyCode::Tab => self.next_waiting(),
-            KeyCode::Char('v') => {
-                self.set_select(!self.select);
-                self.select_sticky = self.select;
-            }
+            KeyCode::Char('v') => self.set_select(!self.select),
             KeyCode::Char('y') if has => self.copy_screen(),
             KeyCode::Char('f') => {
                 match self.zoom.take() {
@@ -1196,12 +1186,13 @@ impl App {
             (y.clamp(pane.y, pane.bottom() - 1) - pane.y, x.clamp(pane.x, pane.right() - 1) - pane.x)
         };
         let (a, b) = (cell(anchor), cell(to));
-        Some(if a <= b { (a, b) } else { (b, a) })
+        (a != b).then(|| if a < b { (a, b) } else { (b, a) }) // a press that never moved is a click
     }
 
     /// Copies the dragged-over text. The selection stays lit so you can see what you got.
     fn copy_picked(&mut self) {
         let (Some(((r1, c1), (r2, c2))), Some(s)) = (self.picked_cells(), self.sessions.get(self.sel)) else {
+            self.flash = Some(" nothing selected · drag over the terminal first ".into());
             return;
         };
         let text = s.parser.lock().unwrap().screen().contents_between(r1, c1, r2, c2 + 1);

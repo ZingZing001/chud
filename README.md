@@ -83,7 +83,7 @@ chud claude copilot     # open these sessions instead
 chud "claude --model opus" zsh
 ```
 
-Drag across the terminal to select text — letting go copies it, and ⌘V pastes it back.
+Drag across the terminal to select text. Letting go copies it, ⌘C copies it again, and ⌘V pastes.
 
 New sessions start in zsh; launch `claude` or `copilot` inside them and chud picks the agent up. Use **+ New ▾** in the toolbar for a new terminal or group. Click a session to switch, right-click it (or its `…`) for its menu, and drag it to move it.
 
@@ -99,7 +99,7 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a z` | Fold / unfold this group |
 | `C-a J` / `K` | Move session down / up |
 | `C-a y` | Copy what this session shows to the clipboard |
-| `C-a v` | Hand the mouse to the terminal (holding ⌥ does the same) |
+| `C-a v` | Hand the mouse to the terminal, to select outside the pane |
 | `C-a f` | Zoom: hide or show the sidebar |
 | `C-a d` | Diff review (`c` commit, `r` discard, `R` refresh) |
 | `C-a s` | Dashboard |
@@ -107,7 +107,7 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a q` | Quit (running `chud` again restores everything) |
 | `C-a C-a` | Send a literal `Ctrl-a` |
 
-In chud.app the usual ⌘ shortcuts work too: ⌘T new session, ⌘W kill it, ⌘1–⌘9 to jump, ⌘+/⌘−/⌘0 for text size, and ⌘V paste.
+In chud.app the usual ⌘ shortcuts work too: ⌘C copy, ⌘V paste, ⌘T new session, ⌘W kill it, ⌘1–⌘9 to jump, and ⌘+/⌘−/⌘0 for text size.
 
 `C-a ?` or the **Help** button shows this list in the app. chud keeps its state in `~/.config/chud/`.
 
