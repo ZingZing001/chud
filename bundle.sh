@@ -6,10 +6,12 @@ cd "$(dirname "$0")"
 # baked in so the running chud can tell when the repo it came from has moved on (src/update.rs)
 CHUD_REPO="$PWD" CHUD_COMMIT="$(git rev-parse HEAD 2>/dev/null)" cargo build --release --workspace
 
+# honour CARGO_TARGET_DIR: the updater runs this from whatever environment chud inherited
+BUILT="${CARGO_TARGET_DIR:-target}/release"
 APP="$HOME/Applications/chud.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/chud target/release/chud-app "$APP/Contents/MacOS/"
+cp "$BUILT/chud" "$BUILT/chud-app" "$APP/Contents/MacOS/"
 cp app/chud.icns "$APP/Contents/Resources/"   # regenerate with: python3 app/icon.py
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
