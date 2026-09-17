@@ -63,6 +63,7 @@ fn icon(agent: &Agent) -> Span<'static> {
     match agent {
         Agent::Claude => Span::styled(pick("\u{ec82} ", "✳ "), pal().claude),
         Agent::Copilot => Span::styled(pick("\u{ec1e} ", "◆ "), pal().copilot),
+        Agent::Profile(i) => Span::styled(format!("{} ", crate::agents::all()[*i].icon), crate::agents::all()[*i].color),
         Agent::Shell => pick("\u{e795} ", "❯ ").gray(),
         Agent::Other(_) => pick("\u{e795} ", "❯ ").dark_gray(),
     }
@@ -72,11 +73,13 @@ fn agent_color(agent: &Agent) -> Color {
     match agent {
         Agent::Claude => pal().claude,
         Agent::Copilot => pal().copilot,
+        Agent::Profile(i) => crate::agents::all()[*i].color,
         _ => Color::Gray,
     }
 }
 
-fn is_agent(s: &Session) -> bool {
+/// Context and usage come from these two agents' logs, which have known formats.
+fn has_usage(s: &Session) -> bool {
     matches!(s.agent, Agent::Claude | Agent::Copilot)
 }
 
@@ -206,8 +209,9 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect) {
                 (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(pal().dim)),
             }
         }
-        Agent::Shell | Agent::Other(_) => {
+        Agent::Profile(_) | Agent::Shell | Agent::Other(_) => {
             let program = match &s.agent {
+                Agent::Profile(i) => crate::agents::all()[*i].name.clone(),
                 Agent::Other(name) => name.clone(),
                 _ => s.argv[0].rsplit('/').next().unwrap_or("shell").to_string(),
             };
@@ -335,7 +339,7 @@ fn session_item(s: &Session, num: usize, headers: bool) -> ListItem<'static> {
         None => detail,
     };
     let mut second = vec![Span::raw(format!("{pad}    "))];
-    if is_agent(s) {
+    if has_usage(s) {
         second.extend(chud::bar(fullness(s), 8));
         second.push(format!(" {:>3.0}% ", fullness(s) * 100.0).fg(pal().dim));
     } else {
@@ -512,7 +516,7 @@ fn card(f: &mut Frame, s: &Session, selected: bool, r: Rect) {
     let mut lines: Vec<Line> = chud_art(s).into_iter().map(Line::centered).collect();
     let name: String = s.label().chars().take(inner.width as usize).collect();
     lines.push(Line::from(name.bold()).centered());
-    if is_agent(s) {
+    if has_usage(s) {
         let p = fullness(s);
         let mut bar = chud::bar(p, inner.width.saturating_sub(6) as usize);
         bar.push(format!(" {:>3.0}%", p * 100.0).into());

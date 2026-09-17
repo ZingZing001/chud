@@ -1,3 +1,4 @@
+use crate::agents::{self, Activity};
 use crate::usage::{self, Usage};
 use anyhow::Result;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -30,20 +31,38 @@ pub enum Event {
 pub enum Agent {
     Claude,
     Copilot,
+    /// one of `agents::all()`: a built-in like Codex, or one from config.json
+    Profile(usize),
     Shell,
     Other(String),
 }
 
 /// Classifies the program at `path` (a session's foreground process, or a command name).
 pub fn agent_of(path: &str) -> Agent {
+    agent_in(path, agents::all())
+}
+
+fn agent_in(path: &str, profiles: &[agents::Profile]) -> Agent {
     let name = path.rsplit('/').next().unwrap_or(path).trim_start_matches('-'); // login shells: "-zsh"
     match name {
         "claude" => Agent::Claude,
         _ if path.contains("/claude/versions/") => Agent::Claude, // native install: .../claude/versions/2.1.270
         "copilot" => Agent::Copilot,
         "zsh" | "bash" | "fish" | "sh" | "dash" | "nu" => Agent::Shell,
-        _ => Agent::Other(name.to_string()),
+        _ => match profiles.iter().position(|p| p.matches.iter().any(|m| m == name)) {
+            Some(i) => Agent::Profile(i),
+            None => Agent::Other(name.to_string()),
+        },
     }
+}
+
+/// The agent a command line runs, for when the process in front is an interpreter:
+/// `node /opt/homebrew/bin/gemini --yolo` is Gemini, `python3 -m aider` is aider.
+fn agent_in_cmdline(args: &str, profiles: &[agents::Profile]) -> Option<Agent> {
+    args.split_whitespace()
+        .skip(1)
+        .map(|word| agent_in(word, profiles))
+        .find(|a| matches!(a, Agent::Claude | Agent::Copilot | Agent::Profile(_)))
 }
 
 /// A chat title from the terminal title: drops Claude's spinner glyphs, Copilot's suffix and
@@ -58,6 +77,8 @@ pub fn chat_name(title: &str) -> Option<String> {
 #[derive(Default)]
 pub struct Signals {
     pub status: Status,
+    /// the program reports progress itself (OSC 9;4), so its status is never guessed
+    pub progress_seen: bool,
     pub title: String,
     pub chat: String,
     pub summary: String,
@@ -84,6 +105,7 @@ impl vt100::Callbacks for Signals {
         match p {
             // progress (Copilot): 0 = cleared, anything else = busy
             [b"9", b"4", state, ..] => {
+                self.progress_seen = true;
                 self.set(if *state == b"0" { Status::Done } else { Status::Working }, None)
             }
             [b"9", ..] => self.set(Status::NeedsInput, Some(rest(1))),
@@ -171,6 +193,9 @@ pub struct Session {
     /// the process in front (the agent, when one runs), and the Copilot session found for it
     fg_pid: Option<i32>,
     found: Option<String>,
+    /// the agent a script or interpreter in front is running, read from its command line
+    fg_script: Option<Agent>,
+    activity: Activity,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -222,6 +247,11 @@ impl Session {
         // ship our own hooks.json plugin if Warp changes that protocol.
         cmd.env("WARP_CLI_AGENT_PROTOCOL_VERSION", "1");
         cmd.env("WARP_CLIENT_VERSION", "v0.2099.01.01.00.00.stable_00");
+        if let Agent::Profile(i) = agent {
+            for (k, v) in &agents::all()[i].env {
+                cmd.env(k, v);
+            }
+        }
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
@@ -270,10 +300,53 @@ impl Session {
             probed: Instant::now(),
             fg_pid: None,
             found: None,
+            fg_script: None,
+            activity: Activity::default(),
             writer,
             master: pair.master,
             child,
         })
+    }
+
+    /// Enter was sent to this session: the start of a possible stretch of work.
+    pub fn submit(&mut self) {
+        if self.infers_status() {
+            self.activity.submit(Instant::now());
+        }
+    }
+
+    /// The program printed something. For an agent that reports nothing itself, that may mean
+    /// it started working.
+    pub fn on_output(&mut self) {
+        self.guess(|a, now, st| a.output(now, st));
+    }
+
+    /// Once a tick: the agent may have gone quiet, which means done. True when the status changed.
+    pub fn on_tick(&mut self) -> bool {
+        self.guess(|a, now, st| a.quiet(now, st))
+    }
+
+    fn guess(&mut self, step: impl FnOnce(&mut Activity, Instant, Status) -> Option<Status>) -> bool {
+        if !self.infers_status() {
+            return false;
+        }
+        let parser = self.parser.clone();
+        let mut p = parser.lock().unwrap();
+        let signals = p.callbacks_mut();
+        if signals.progress_seen {
+            return false;
+        }
+        match step(&mut self.activity, Instant::now(), signals.status) {
+            Some(st) => {
+                signals.status = st;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn infers_status(&self) -> bool {
+        self.exit.is_none() && matches!(self.agent, Agent::Profile(i) if agents::all().get(i).is_some_and(|p| p.infer_status))
     }
 
     pub fn write(&self, bytes: &[u8]) {
@@ -339,9 +412,21 @@ impl Session {
         }
         self.probed = Instant::now();
         let Some(pid) = self.master.process_group_leader() else { return false };
-        let Some(agent) = proc_path(pid).map(|p| agent_of(&p)) else { return false };
+        let Some(mut agent) = proc_path(pid).map(|p| agent_of(&p)) else { return false };
         if self.fg_pid != Some(pid) {
             (self.fg_pid, self.found) = (Some(pid), None);
+            // A shell or an interpreter may be running an agent: a custom harness is often a
+            // script, and Gemini CLI is Node. The command line says which; it is read once per
+            // process, not on every burst of output.
+            let scripted = match &agent {
+                Agent::Shell => true,
+                Agent::Other(name) => agents::is_interpreter(name),
+                _ => false,
+            };
+            self.fg_script = if scripted { proc_args(pid).and_then(|a| agent_in_cmdline(&a, agents::all())) } else { None };
+        }
+        if let Some(script) = &self.fg_script {
+            agent = script.clone();
         }
         if agent == self.agent {
             return false;
@@ -446,6 +531,12 @@ fn uuid() -> String {
     format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
 }
 
+/// The full command line of `pid`, for interpreters whose path alone does not say what they run.
+fn proc_args(pid: i32) -> Option<String> {
+    let out = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|a| !a.is_empty())
+}
+
 #[cfg(target_os = "macos")]
 fn proc_path(pid: i32) -> Option<String> {
     let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
@@ -533,6 +624,17 @@ mod tests {
         assert_eq!(agent_of("/bin/zsh"), Agent::Shell);
         assert_eq!(agent_of("-zsh"), Agent::Shell);
         assert_eq!(agent_of("/usr/bin/vim"), Agent::Other("vim".into()));
+
+        let profiles = agents::from_config(&serde_json::json!({ "agents": [{ "name": "mine", "match": ["mh"] }] }));
+        let index = |n: &str| Agent::Profile(profiles.iter().position(|p| p.name == n).unwrap());
+        assert_eq!(agent_in("/opt/homebrew/bin/codex", &profiles), index("codex"));
+        assert_eq!(agent_in("/usr/local/bin/mh", &profiles), index("mine"), "a harness from config.json");
+        assert_eq!(agent_in("/Users/me/.local/share/claude/versions/2.1.270", &profiles), Agent::Claude);
+        assert_eq!(agent_in("/opt/homebrew/bin/node", &profiles), Agent::Other("node".into()));
+        let cmdline = |a: &str| agent_in_cmdline(a, &profiles);
+        assert_eq!(cmdline("node /opt/homebrew/bin/gemini --yolo"), Some(index("gemini")), "a Node agent");
+        assert_eq!(cmdline("python3 -m aider --model x"), Some(index("aider")), "a Python agent");
+        assert_eq!(cmdline("node /usr/lib/node_modules/vite/bin/vite.js"), None, "node running something else");
     }
 
     #[test]

@@ -1,4 +1,6 @@
+mod agents;
 mod chud;
+mod config;
 mod git;
 mod update;
 mod session;
@@ -16,7 +18,7 @@ use ratatui::layout::Rect;
 use serde_json::{json, Value};
 use session::{Agent, Event, Session, Status};
 use std::io::{stdout, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -300,9 +302,12 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
             Err(_) => break,
         }
     }
+    let cfg = config::load();
+    agents::init(&cfg); // before any session is classified
     let var = |k| std::env::var(k).ok();
-    chud::set_safe(!ui::block_glyphs(var("TERM_PROGRAM").as_deref(), var("CHUD_MASCOT").as_deref()));
-    let chosen = var("CHUD_THEME");
+    let mascot = config::setting(&cfg, "mascot", "CHUD_MASCOT");
+    chud::set_safe(!ui::block_glyphs(var("TERM_PROGRAM").as_deref(), mascot.as_deref()));
+    let chosen = config::setting(&cfg, "theme", "CHUD_THEME");
     app.theme_follows = !matches!(chosen.as_deref(), Some("light" | "dark"));
     theme::set_light(theme::choose(chosen.as_deref(), var("COLORFGBG").as_deref()));
 
@@ -375,6 +380,7 @@ impl App {
                     if agent {
                         self.sessions[i].refresh_usage(); // a new agent in front: follow its usage
                     }
+                    self.sessions[i].on_output();
                     let status = self.check_status(i);
                     agent || status || (i == self.sel && self.diff.is_none() && !self.dash)
                 }
@@ -434,6 +440,12 @@ impl App {
 
     /// Once a second while something works or the summary is open: keep usage numbers fresh.
     fn tick(&mut self) {
+        // agents that report nothing themselves: gone quiet after working means done
+        for i in 0..self.sessions.len() {
+            if self.sessions[i].on_tick() {
+                self.check_status(i);
+            }
+        }
         let every = if self.dash { 2 } else { 3 };
         if self.last_usage.elapsed() >= every * TICK {
             let all = self.dash;
@@ -543,12 +555,15 @@ impl App {
             }
             return;
         }
-        if let Some(s) = self.sessions.get(self.sel) {
+        if let Some(s) = self.sessions.get_mut(self.sel) {
             let mut p = s.parser.lock().unwrap();
             p.screen_mut().set_scrollback(0);
             let bytes = key_bytes(k, p.screen().application_cursor());
             drop(p);
             s.write(&bytes);
+            if k.code == KeyCode::Enter {
+                s.submit();
+            }
         }
     }
 
@@ -1248,11 +1263,11 @@ fn statusline() -> Result<()> {
     let v: Value = serde_json::from_str(&input).unwrap_or_default();
     // this session's context window, for the bar chud draws beside the session
     if let (Some(sid), true) = (v["session_id"].as_str(), v["context_window"].is_object()) {
-        save(&usage::context_path(sid), &v["context_window"].to_string());
+        config::write_atomic(&usage::context_path(sid), &v["context_window"].to_string());
     }
     let path = usage::limits_path();
     let limits = if v["rate_limits"].is_object() {
-        save(&path, &v["rate_limits"].to_string());
+        config::write_atomic(&path, &v["rate_limits"].to_string());
         v["rate_limits"].clone()
     } else {
         // not sent yet this session (it comes with the first reply): show the last known
@@ -1265,16 +1280,6 @@ fn statusline() -> Result<()> {
         _ => {}
     }
     Ok(())
-}
-
-/// Writes a file the way a status line must: in one step, since every Claude session in the
-/// house runs this at once.
-fn save(path: &Path, text: &str) {
-    let _ = std::fs::create_dir_all(path.parent().unwrap_or(path));
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
 }
 
 fn pbcopy(text: &str) -> std::io::Result<()> {
