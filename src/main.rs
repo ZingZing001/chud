@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 const FRAME: Duration = Duration::from_millis(16);
 const TICK: Duration = Duration::from_secs(1);
 const SIDE: u16 = 38;
-const DEFAULT_CMD: &str = "zsh"; // what a new terminal runs
+const DEFAULT_CMD: &str = if cfg!(windows) { "powershell" } else { "zsh" }; // what a new terminal runs
 
 enum Ask {
     Commit,
@@ -149,7 +149,7 @@ impl Setup {
         std::thread::spawn(move || {
             let _ = tx.send(Event::SetupChecks(setup::check_warp(), setup::check_gh()));
         });
-        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let home = config::home();
         let settings = std::fs::read_to_string(setup::settings_path(&home)).ok();
         let settings: Value = settings.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         let at = |list: &[&str], key: &str| list.iter().position(|v| cfg[key].as_str() == Some(v));
@@ -254,7 +254,7 @@ fn resume_argv(argv: &[String], sid: &str, saved: bool) -> Vec<String> {
 }
 
 fn state_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/chud/state.json")
+    config::home().join(".config/chud/state.json")
 }
 
 struct App {
@@ -736,7 +736,7 @@ impl App {
         let Some(s) = self.sessions.get(self.sel) else { return };
         let text = s.parser.lock().unwrap().screen().contents();
         let lines = text.lines().count();
-        self.flash = match pbcopy(&text) {
+        self.flash = match copy_to_clipboard(&text) {
             Ok(()) => Some(format!(" copied {lines} lines to the clipboard ")),
             Err(e) => Some(format!(" could not copy: {e} ")),
         };
@@ -854,7 +854,7 @@ impl App {
         if argv.len() > 1 {
             let last = argv.last().unwrap();
             let dir = match last.strip_prefix('~') {
-                Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default() + rest),
+                Some(rest) => PathBuf::from(format!("{}{rest}", config::home().display())),
                 None => PathBuf::from(last),
             };
             if dir.is_dir() {
@@ -864,7 +864,7 @@ impl App {
         }
         match argv.first().map(String::as_str) {
             None => return,
-            Some("shell") => argv[0] = std::env::var("SHELL").unwrap_or("zsh".into()),
+            Some("shell") => argv[0] = std::env::var("SHELL").unwrap_or(DEFAULT_CMD.into()),
             _ => {}
         }
         let group = self.sessions.get(self.sel).map_or(0, |s| s.group);
@@ -1319,7 +1319,7 @@ impl App {
             3 if !s.choices().is_empty() => {
                 s.status_result = Some(match s.choice {
                     0 => {
-                        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+                        let home = config::home();
                         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or("chud".into());
                         let replace = matches!(s.status_line, setup::StatusLine::Foreign(_));
                         setup::enable_status_line(&home, &exe, replace)
@@ -1521,7 +1521,7 @@ impl App {
             return;
         };
         let text = s.parser.lock().unwrap().screen().contents_between(r1, c1, r2, c2 + 1);
-        self.flash = match (text.is_empty(), pbcopy(&text)) {
+        self.flash = match (text.is_empty(), copy_to_clipboard(&text)) {
             (true, _) => None,
             (_, Ok(())) => Some(format!(" copied {} characters to the clipboard ", text.chars().count())),
             (_, Err(e)) => Some(format!(" could not copy: {e} ")),
@@ -1578,11 +1578,29 @@ fn statusline() -> Result<()> {
     Ok(())
 }
 
-fn pbcopy(text: &str) -> std::io::Result<()> {
-    let mut child = Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn()?;
-    child.stdin.take().expect("piped").write_all(text.as_bytes())?;
-    child.wait()?;
-    Ok(())
+/// Puts text on the system clipboard with whatever this platform provides: pbcopy on macOS,
+/// PowerShell on Windows (reading UTF-8, so non-ASCII survives), wl-copy or xclip on Linux.
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    let windows = "[Console]::InputEncoding = [Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())";
+    let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[("powershell", &["-NoProfile", "-Command", windows])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+    };
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no clipboard tool found");
+    for (cmd, args) in tools {
+        match Command::new(cmd).args(*args).stdin(std::process::Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                child.stdin.take().expect("piped").write_all(text.as_bytes())?;
+                child.wait()?;
+                return Ok(());
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 fn notify(title: &str, body: &str) {
@@ -1591,9 +1609,25 @@ fn notify(title: &str, body: &str) {
     match std::env::var("TERM_PROGRAM").as_deref() {
         Ok("iTerm.app") => print!("\x1b]9;{title}: {body}\x07"),
         Ok("WarpTerminal" | "ghostty" | "WezTerm") => print!("\x1b]777;notify;{title};{body}\x07"),
-        _ => {
+        // otherwise the desktop's own notifications
+        _ if cfg!(target_os = "macos") => {
             let script = format!("display notification {body:?} with title {title:?}");
             std::thread::spawn(move || Command::new("osascript").args(["-e", &script]).status());
+        }
+        _ if cfg!(windows) => {
+            // a toast through PowerShell's own app id, which Windows lets post without registering
+            let quote = |s: &str| s.replace('\'', "''");
+            let script = format!(
+                "$x = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]::GetTemplateContent(1); \
+                 $t = $x.GetElementsByTagName('text'); $t[0].AppendChild($x.CreateTextNode('{}')) > $null; $t[1].AppendChild($x.CreateTextNode('{}')) > $null; \
+                 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+                quote(&title),
+                quote(&body)
+            );
+            std::thread::spawn(move || Command::new("powershell").args(["-NoProfile", "-Command", &script]).status());
+        }
+        _ => {
+            std::thread::spawn(move || Command::new("notify-send").args([title.as_str(), body.as_str()]).status());
         }
     }
     let _ = stdout().flush();

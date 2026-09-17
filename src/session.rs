@@ -45,12 +45,13 @@ pub fn agent_of(path: &str) -> Agent {
 }
 
 fn agent_in(path: &str, profiles: &[agents::Profile]) -> Agent {
-    let name = path.rsplit('/').next().unwrap_or(path).trim_start_matches('-'); // login shells: "-zsh"
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).trim_start_matches('-'); // login shells: "-zsh"
+    let name = name.strip_suffix(".exe").unwrap_or(name); // Windows
     match name {
         "claude" => Agent::Claude,
         _ if path.contains("/claude/versions/") => Agent::Claude, // native install: .../claude/versions/2.1.270
         "copilot" => Agent::Copilot,
-        "zsh" | "bash" | "fish" | "sh" | "dash" | "nu" => Agent::Shell,
+        "zsh" | "bash" | "fish" | "sh" | "dash" | "nu" | "powershell" | "pwsh" | "cmd" => Agent::Shell,
         _ => match profiles.iter().position(|p| p.matches.iter().any(|m| m == name)) {
             Some(i) => Agent::Profile(i),
             None => Agent::Other(name.to_string()),
@@ -378,6 +379,19 @@ impl Session {
         }
     }
 
+    /// The process in front of this terminal. Unix terminals track it; Windows' ConPTY does not,
+    /// so there an agent is known only from how its session was started, not one typed into a
+    /// shell afterwards.
+    #[cfg(unix)]
+    fn foreground_pid(&self) -> Option<i32> {
+        self.master.process_group_leader()
+    }
+
+    #[cfg(not(unix))]
+    fn foreground_pid(&self) -> Option<i32> {
+        None
+    }
+
     pub fn resize(&self, (rows, cols): (u16, u16)) {
         let mut p = self.parser.lock().unwrap();
         if p.screen().size() == (rows, cols) {
@@ -431,7 +445,7 @@ impl Session {
             return false;
         }
         self.probed = Instant::now();
-        let Some(pid) = self.master.process_group_leader() else { return false };
+        let Some(pid) = self.foreground_pid() else { return false };
         let Some(mut agent) = proc_path(pid).map(|p| agent_of(&p)) else { return false };
         if self.fg_pid != Some(pid) {
             (self.fg_pid, self.found) = (Some(pid), None);
@@ -467,7 +481,7 @@ impl Session {
         };
         // the running agent's own session, found by its pid: this also covers an agent
         // started by hand in a shell, where chud didn't choose the session id
-        let home = std::env::var("HOME").map(PathBuf::from);
+        let home: Result<PathBuf, ()> = Ok(crate::config::home());
         let by_pid = match (self.fg_pid, &home) {
             (Some(pid), Ok(home)) if copilot && self.found.is_none() => {
                 self.found = find_sid(home, &self.agent, pid).map(|(sid, _)| sid);
@@ -655,6 +669,8 @@ mod tests {
         assert_eq!(cmdline("node /opt/homebrew/bin/gemini --yolo"), Some(index("gemini")), "a Node agent");
         assert_eq!(cmdline("python3 -m aider --model x"), Some(index("aider")), "a Python agent");
         assert_eq!(cmdline("node /usr/lib/node_modules/vite/bin/vite.js"), None, "node running something else");
+        assert_eq!(agent_in(r"C:\Users\me\AppData\Local\codex\codex.exe", &profiles), index("codex"), "Windows paths");
+        assert_eq!(agent_in(r"C:\Program Files\PowerShell\7\pwsh.exe", &profiles), Agent::Shell);
     }
 
     #[test]

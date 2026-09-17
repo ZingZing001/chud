@@ -3,8 +3,13 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+/// Your home folder: HOME, or USERPROFILE on Windows, which has no HOME.
+pub fn home() -> PathBuf {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default()
+}
+
 pub fn path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/chud/config.json")
+    home().join(".config/chud/config.json")
 }
 
 /// What you chose, or `{}` when there is no config yet or it cannot be read: every setting has a

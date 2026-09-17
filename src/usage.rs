@@ -34,7 +34,7 @@ pub fn log_path(copilot: bool, sid: &str, cwd: &Path) -> Option<PathBuf> {
     if sid.is_empty() {
         return None;
     }
-    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    let home = crate::config::home();
     Some(if copilot {
         home.join(".copilot/session-state").join(sid).join("events.jsonl")
     } else {
@@ -48,15 +48,25 @@ pub fn log_path(copilot: bool, sid: &str, cwd: &Path) -> Option<PathBuf> {
 /// zone and whether daylight saving was on.
 pub fn local_minute(minute: u64) -> u64 {
     static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    let offset = *OFFSET.get_or_init(|| {
-        let t = now_secs() as libc::time_t;
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        match unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-            true => 0,
-            false => tm.tm_gmtoff as i64 / 60,
-        }
-    });
+    let offset = *OFFSET.get_or_init(utc_offset_minutes);
     minute.saturating_add_signed(offset)
+}
+
+#[cfg(unix)]
+fn utc_offset_minutes() -> i64 {
+    let t = now_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    match unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        true => 0,
+        false => tm.tm_gmtoff as i64 / 60,
+    }
+}
+
+// ponytail: Windows shows the activity grid in UTC; its time zone API needs windows-sys,
+// add that when someone runs chud on Windows and misses local hours
+#[cfg(not(unix))]
+fn utc_offset_minutes() -> i64 {
+    0
 }
 
 /// Minutes since the Unix epoch for an RFC 3339 UTC timestamp ("2026-09-14T02:04:52.692Z").
@@ -216,12 +226,12 @@ pub fn now_secs() -> u64 {
 
 /// Where `chud --statusline` keeps the plan limits Claude Code hands its status line.
 pub fn limits_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/chud/claude-limits.json")
+    crate::config::home().join(".config/chud/claude-limits.json")
 }
 
 /// Where it keeps that session's context window, one file per session id.
 pub fn context_path(sid: &str) -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(format!(".config/chud/context/{sid}.json"))
+    crate::config::home().join(format!(".config/chud/context/{sid}.json"))
 }
 
 /// What Claude Code says is in this session's context window, which is the honest answer:

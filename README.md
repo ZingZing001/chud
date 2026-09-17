@@ -32,6 +32,7 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 ### Prerequisites
 
 - macOS. That's what chud is built and tested on, and the app bundle is macOS-only.
+  - **Windows** is groundwork only: chud and chud.app compile for Windows, and the theme, clipboard and notifications have Windows code paths. None of it has been run on Windows yet, there is no installer, and agents started by hand inside a shell aren't detected there.
 - [Rust](https://rustup.rs) 1.85 or newer (the crates use edition 2024).
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and/or [GitHub Copilot CLI](https://github.com/github/copilot-cli).
 - Optional: the [GitHub CLI](https://cli.github.com) (`gh`), logged in, for the Copilot quota in the header.

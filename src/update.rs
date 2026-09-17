@@ -52,6 +52,9 @@ pub fn install(repo: &Path) -> Result<(), String> {
 /// there is no network: an update that cannot be fetched is not news.
 pub fn watch(tx: Sender<Event>) {
     let (Some(repo), Some(built)) = (repo(), option_env!("CHUD_COMMIT")) else { return };
+    if cfg!(windows) {
+        return; // bundle.sh builds a macOS app; there is no Windows install to update yet
+    }
     if std::env::var_os("CHUD_NO_UPDATE").is_some() {
         return;
     }

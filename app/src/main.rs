@@ -120,22 +120,30 @@ struct App {
 
 impl App {
     fn new() -> (Self, Task<Message>) {
-        let chud = std::env::current_exe().map(|p| p.with_file_name("chud")).unwrap_or_else(|_| "chud".into());
+        let name = if cfg!(windows) { "chud.exe" } else { "chud" };
+        let chud = std::env::current_exe().map(|p| p.with_file_name(name)).unwrap_or_else(|_| name.into());
         // A login + interactive shell gives chud (and the agents it starts) your real PATH;
         // apps launched from the Dock otherwise get only /usr/bin:/bin.
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let mut args: Vec<String> = ["-l", "-i", "-c", r#"exec "$0" "$@""#].map(String::from).into();
-        args.push(chud.to_string_lossy().into_owned());
-        args.extend(std::env::args().skip(1)); // `open -a chud --args claude` starts a claude session
+        let (program, args) = if cfg!(windows) {
+            // Windows programs get the user's environment already: run chud directly
+            (chud.to_string_lossy().into_owned(), std::env::args().skip(1).collect::<Vec<_>>())
+        } else {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            let mut args: Vec<String> = ["-l", "-i", "-c", r#"exec "$0" "$@""#].map(String::from).into();
+            args.push(chud.to_string_lossy().into_owned());
+            args.extend(std::env::args().skip(1)); // `open -a chud --args claude` starts a claude session
+            (shell, args)
+        };
         let env = [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "chud-app")]
             .map(|(k, v)| (k.to_string(), v.to_string()));
         let settings = Settings {
             font: font(FONT_SIZE),
             backend: BackendSettings {
-                program: shell,
+                program,
                 args,
                 env: HashMap::from(env),
-                working_directory: std::env::var_os("HOME").map(Into::into), // Dock apps start in /
+                // Dock apps start in /; Windows keeps the home folder in USERPROFILE
+                working_directory: std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(Into::into),
             },
             ..Default::default()
         };
