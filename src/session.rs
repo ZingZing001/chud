@@ -308,6 +308,20 @@ impl Session {
         })
     }
 
+    /// You answered what the agent was waiting on. Agents only report again when the *next*
+    /// step ends — Claude's comes when the tool you approved finishes, which can be minutes — so
+    /// the answer itself is taken as the sign it is back at work. Asking again sets it back.
+    pub fn answered(&mut self) -> bool {
+        let parser = self.parser.clone();
+        let mut p = parser.lock().unwrap();
+        let signals = p.callbacks_mut();
+        if self.exit.is_some() || signals.status != Status::NeedsInput {
+            return false;
+        }
+        signals.status = Status::Working;
+        true
+    }
+
     /// Enter was sent to this session: the start of a possible stretch of work.
     pub fn submit(&mut self) {
         if self.infers_status() {

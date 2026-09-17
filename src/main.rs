@@ -555,6 +555,7 @@ impl App {
             }
             return;
         }
+        let mut answered = false;
         if let Some(s) = self.sessions.get_mut(self.sel) {
             let mut p = s.parser.lock().unwrap();
             p.screen_mut().set_scrollback(0);
@@ -564,6 +565,12 @@ impl App {
             if k.code == KeyCode::Enter {
                 s.submit();
             }
+            // Enter or Esc, or a number (Claude's prompts take 1/2/3), answers a waiting agent;
+            // arrow keys only move the highlight, so they do not
+            answered = matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('1'..='9')) && s.answered();
+        }
+        if answered {
+            self.check_status(self.sel); // the badge and the working timer update now, not later
         }
     }
 
