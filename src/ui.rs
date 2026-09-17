@@ -152,15 +152,8 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
         diff(f, d, main, &mut hits);
     } else if app.dash {
         dashboard(f, app, main, &mut hits);
-    } else if let Some(s) = app.sessions.get(app.sel) {
-        let [head, term] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-        session_header(f, s, &app.plan, head);
-        let p = s.parser.lock().unwrap();
-        let screen = p.screen();
-        let cursor = Cursor::default().visibility(!screen.hide_cursor() && screen.scrollback() == 0);
-        f.render_widget(PseudoTerminal::new(screen).cursor(cursor), term);
-        picked(f, app, term);
-        hits.push((term, Hit::Pane));
+    } else if !app.sessions.is_empty() {
+        panes(f, app, main, &mut hits);
     } else {
         f.render_widget(Paragraph::new(" No sessions yet. Click + New, or press Ctrl-a n.").fg(pal().dim), main);
     }
@@ -322,12 +315,45 @@ fn setup(f: &mut Frame, s: &Setup, hits: &mut Hits) {
     }
 }
 
+/// Every pane in the layout — a header and a terminal each — and the dividers between them.
+fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
+    let split = app.layout.leaves().len() > 1;
+    for (id, rect) in app.layout.rects(main) {
+        let Some(i) = app.sessions.iter().position(|s| s.id == id) else { continue };
+        let s = &app.sessions[i];
+        let [head, term] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(rect);
+        session_header(f, s, &app.plan, head, split && i == app.sel);
+        let p = s.parser.lock().unwrap();
+        let screen = p.screen();
+        // the cursor shows only where your typing goes
+        let cursor = Cursor::default().visibility(i == app.sel && !screen.hide_cursor() && screen.scrollback() == 0);
+        f.render_widget(PseudoTerminal::new(screen).cursor(cursor), term);
+        drop(p);
+        if i == app.sel {
+            picked(f, app, term);
+        }
+        hits.push((term, Hit::Pane(i)));
+    }
+    let dragging = |k: usize| matches!(app.drag, Some(Drag { from: Hit::Divider(d), .. }) if d == k);
+    for (k, div) in app.layout.dividers(main).into_iter().enumerate() {
+        let colour = if dragging(k) { pal().accent } else { pal().dim };
+        let lines: Vec<Line> = match div.dir {
+            crate::layout::Dir::Across => (0..div.rect.height).map(|_| Line::from("│")).collect(),
+            crate::layout::Dir::Down => vec![Line::from("─".repeat(div.rect.width as usize))],
+        };
+        f.render_widget(Paragraph::new(lines).fg(colour), div.rect);
+        hits.push((div.rect, Hit::Divider(k)));
+    }
+}
+
 /// One line above the terminal: what's running in it and, for an agent, your plan's usage:
 /// Claude's rolling 5-hour limit (plus the week), Copilot's monthly premium requests. It follows
 /// whichever agent is in front, including one started by hand in a shell. (Context fullness
 /// lives in the sidebar.)
-fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect) {
-    let mut spans = vec![Span::raw(" "), icon(&s.agent)];
+fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: bool) {
+    // in a split, a bar in the accent colour marks the pane your typing goes to
+    let lead = if focused { "▌".fg(pal().accent) } else { Span::raw(" ") };
+    let mut spans = vec![lead, icon(&s.agent)];
     match &s.agent {
         Agent::Claude | Agent::Copilot => {
             let claude = s.agent == Agent::Claude;
@@ -739,7 +765,7 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         Some(Drag { from: Hit::Edge, .. }) => " drag to resize the sidebar ",
         _ if app.diff.is_some() => " diff: j/k file · J/K scroll · c commit all · r discard file · R refresh · Esc close ",
         _ if app.dash => " summary: click a card to open that session · scroll for more · Esc close ",
-        _ if app.prefix => " n new · r rename · g group · z fold · f zoom · y copy · s dashboard · d diff · x kill · q quit · ? help ",
+        _ if app.prefix => " n new · | split · - stack · o next pane · r rename · g group · f zoom · y copy · s dashboard · d diff · x kill · ? help ",
         _ => " C-a ? help · click, drag and scroll with the mouse ",
     };
     let mut spans = vec![if app.prefix { keys.black().on_yellow() } else { keys.into() }];
@@ -793,6 +819,8 @@ const HELP: &[(&str, &str)] = &[
     ("⌘C / ⌘V", "copy what you selected · paste"),
     ("C-a v", "hand the mouse to the terminal, to select outside the pane"),
     ("C-a f", "zoom: hide or show the sidebar"),
+    ("C-a | / -", "split the pane side by side / stacked (drag a divider to resize)"),
+    ("C-a o", "move to the next pane"),
     ("C-a d", "diff review (c commit, r discard, R refresh)"),
     ("C-a s", "summary dashboard"),
     ("C-a x", "kill session"),

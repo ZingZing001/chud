@@ -14,6 +14,7 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 |---|---|
 | **Live agent status** | Working, needs input, done, or exited, for Claude Code and Copilot CLI. It also picks up agents you start by hand inside a shell session. |
 | **Notifications & unread markers** | A macOS notification when an agent finishes or asks for input; a marker on sessions you haven't looked at since. |
+| **Split panes** | Watch several agents at once: split any pane side by side or stacked, drag dividers to resize. The layout survives a restart. |
 | **Any agent** | Codex, Gemini CLI, aider, opencode and amp out of the box; add your own harness in `config.json`. |
 | **Light and dark** | Follows the system theme, live in chud.app. |
 | **Plan usage header** | Claude's rolling 5-hour limit with a reset countdown plus the weekly %, or Copilot's monthly premium requests. |
@@ -91,6 +92,8 @@ chud claude copilot     # open these sessions instead
 chud "claude --model opus" zsh
 ```
 
+Split with `C-a |` or `C-a -` (⌘D in chud.app), click a pane to type into it, and drag the line between panes to resize. Picking a session in the sidebar shows it in the focused pane.
+
 Drag across the terminal to select text. Letting go copies it, ⌘C copies it again, and ⌘V pastes.
 
 New sessions start in zsh; launch `claude` or `copilot` inside them and chud picks the agent up. Use **+ New ▾** in the toolbar for a new terminal or group. Click a session to switch, right-click it (or its `…`) for its menu, and drag it to move it.
@@ -109,13 +112,15 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a y` | Copy what this session shows to the clipboard |
 | `C-a v` | Hand the mouse to the terminal, to select outside the pane |
 | `C-a f` | Zoom: hide or show the sidebar |
+| `C-a \|` / `C-a -` | Split the focused pane side by side / stacked |
+| `C-a o` | Move to the next pane |
 | `C-a d` | Diff review (`c` commit, `r` discard, `R` refresh) |
 | `C-a s` | Dashboard |
 | `C-a x` | Kill session |
 | `C-a q` | Quit (running `chud` again restores everything) |
 | `C-a C-a` | Send a literal `Ctrl-a` |
 
-In chud.app the usual ⌘ shortcuts work too: ⌘C copy, ⌘V paste, ⌘T new session, ⌘W kill it, ⌘1–⌘9 to jump, and ⌘+/⌘−/⌘0 for text size.
+In chud.app the usual ⌘ shortcuts work too: ⌘C copy, ⌘V paste, ⌘T new session, ⌘W kill it, ⌘D / ⌘⇧D split, ⌘1–⌘9 to jump, and ⌘+/⌘−/⌘0 for text size.
 
 `C-a ?` or the **Help** button shows this list in the app. chud keeps its state in `~/.config/chud/`.
 

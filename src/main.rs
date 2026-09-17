@@ -2,6 +2,7 @@ mod agents;
 mod chud;
 mod config;
 mod git;
+mod layout;
 mod update;
 mod session;
 mod setup;
@@ -110,7 +111,10 @@ enum Hit {
     DiffAct(DiffAct),
     Card(usize),
     Cards,
-    Pane,
+    /// the terminal pane showing this session
+    Pane(usize),
+    /// the divider between split panes, by its position in `layout.dividers()`
+    Divider(usize),
     Backdrop,
     SetupChoice(usize),
     SetupBack,
@@ -288,6 +292,8 @@ struct App {
     /// no theme was chosen, so chud.app may switch it when the system does
     theme_follows: bool,
     setup: Option<Setup>,
+    /// which sessions are on screen, and how the main area is split between them
+    layout: layout::Node,
     last_usage: Instant,
     plan: usage::Plan,
     tx: mpsc::Sender<Event>,
@@ -355,6 +361,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         update: None,
         theme_follows: true,
         setup: None,
+        layout: layout::Node::Leaf(0),
         last_usage: Instant::now(),
         plan: usage::Plan::default(),
         tx,
@@ -389,6 +396,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     if app.sessions.is_empty() {
         app.open(DEFAULT_CMD); // like any terminal app: start with a shell
     }
+    app.apply_layout();
     // first start (no config yet), or asked for; CHUD_SETUP=skip is for scripts and tests
     let skip = std::env::var("CHUD_SETUP").as_deref() == Ok("skip");
     if !flags.is_empty() || (!config::exists() && !skip) {
@@ -576,10 +584,7 @@ impl App {
                 // frame then shows through. Start from a clean screen instead.
                 self.resized = true;
                 self.size = (w, h);
-                let size = self.pane();
-                for s in &self.sessions {
-                    s.resize(size);
-                }
+                self.apply_layout();
             }
             Input::FocusGained => {
                 self.focused = true;
@@ -681,8 +686,12 @@ impl App {
                     Some(width) => self.side = width,
                     None => self.zoom = Some(std::mem::replace(&mut self.side, 0)),
                 }
+                self.apply_layout(); // the panes just got wider or narrower
                 self.save();
             }
+            KeyCode::Char('|') => self.split(layout::Dir::Across),
+            KeyCode::Char('-') => self.split(layout::Dir::Down),
+            KeyCode::Char('o') => self.next_pane(),
             KeyCode::Char('d') => self.tool(Tool::Diff),
             KeyCode::Char('s') => self.tool(Tool::Dash),
             KeyCode::Char('?') => self.tool(Tool::Help),
@@ -820,7 +829,8 @@ impl App {
     fn confirm(&mut self, ask: Ask) {
         match ask {
             Ask::Kill if self.sel < self.sessions.len() => {
-                self.sessions.remove(self.sel); // Drop kills the child
+                let id = self.sessions.remove(self.sel).id; // Drop kills the child
+                self.layout.remove(id);
                 self.select(self.sel.min(self.sessions.len().saturating_sub(1)));
                 self.save();
             }
@@ -875,6 +885,66 @@ impl App {
         }
     }
 
+    /// The main area: right of the sidebar, between the toolbar and the status bar.
+    fn main_area(&self) -> Rect {
+        let (w, h) = self.size;
+        Rect::new(self.side.min(w), 1, w.saturating_sub(self.side), h.saturating_sub(2))
+    }
+
+    /// Drops panes whose session is gone, and makes sure something is on screen.
+    fn fix_layout(&mut self) {
+        for id in self.layout.leaves() {
+            if !self.sessions.iter().any(|s| s.id == id) {
+                self.layout.remove(id);
+            }
+        }
+        let shown = self.layout.leaves().iter().any(|id| self.sessions.iter().any(|s| s.id == *id));
+        if !shown && let Some(s) = self.sessions.get(self.sel).or(self.sessions.first()) {
+            self.layout = layout::Node::Leaf(s.id);
+        }
+    }
+
+    /// Sizes each session's terminal to its pane — sessions not on screen to the whole area — so
+    /// every agent redraws for the space it really has.
+    fn apply_layout(&mut self) {
+        self.fix_layout();
+        let panes = self.layout.rects(self.main_area());
+        let whole = self.pane();
+        for s in &self.sessions {
+            let size = panes
+                .iter()
+                .find(|(id, _)| *id == s.id)
+                .map_or(whole, |(_, r)| (r.height.saturating_sub(1).max(4), r.width.max(20))); // a header row above each
+            s.resize(size);
+        }
+    }
+
+    /// Splits the focused pane and starts a shell in the new half, as tmux does.
+    fn split(&mut self, dir: layout::Dir) {
+        let Some(at) = self.sessions.get(self.sel).map(|s| s.id) else { return };
+        let room = self.layout.rects(self.main_area()).into_iter().find(|(id, _)| *id == at);
+        if !room.is_some_and(|(_, r)| layout::fits(r, dir)) {
+            self.flash = Some(" not enough room to split this pane · make the window bigger or zoom with C-a f ".into());
+            return;
+        }
+        let (cwd, group) = (self.sessions[self.sel].cwd.clone(), self.sessions[self.sel].group);
+        if let Some(i) = self.spawn(vec![DEFAULT_CMD.into()], cwd, group) {
+            self.layout.split(at, dir, self.sessions[i].id);
+            self.select(i); // already on screen, so this only moves the focus
+            self.apply_layout();
+            self.save();
+        }
+    }
+
+    fn next_pane(&mut self) {
+        let leaves = self.layout.leaves();
+        let at = self.sessions.get(self.sel).and_then(|s| leaves.iter().position(|id| *id == s.id));
+        let next = leaves[at.map_or(0, |p| (p + 1) % leaves.len())];
+        if let Some(i) = self.sessions.iter().position(|s| s.id == next) {
+            self.select(i);
+        }
+    }
+
     fn spawn(&mut self, argv: Vec<String>, cwd: PathBuf, group: usize) -> Option<usize> {
         let mut s = Session::spawn(self.next_id, argv, cwd, self.pane(), self.tx.clone()).ok()?;
         s.group = group;
@@ -901,6 +971,19 @@ impl App {
 
     fn select(&mut self, i: usize) {
         self.picked = None; // a selection belongs to the session it was made in
+        let before = self.sessions.get(self.sel).map(|s| s.id);
+        if let Some(id) = self.sessions.get(i).map(|s| s.id).filter(|id| !self.layout.contains(*id)) {
+            // not on screen: it takes the focused pane (or the first, if focus was elsewhere)
+            let target = before.filter(|b| self.layout.contains(*b)).or(self.layout.leaves().first().copied());
+            match target {
+                Some(old) => {
+                    self.layout.replace(old, id);
+                }
+                None => self.layout = layout::Node::Leaf(id),
+            }
+            self.sel = i;
+            self.apply_layout();
+        }
         self.sel = i;
         self.diff = None;
         self.dash = false;
@@ -1022,7 +1105,8 @@ impl App {
             .collect();
         let path = state_path();
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let state = json!({ "side": self.zoom.unwrap_or(self.side), "groups": groups, "sessions": sessions });
+        let layout = self.layout.to_json(&|id| self.sessions.iter().position(|s| s.id == id));
+        let state = json!({ "side": self.zoom.unwrap_or(self.side), "groups": groups, "sessions": sessions, "layout": layout });
         let _ = std::fs::write(&path, state.to_string());
     }
 
@@ -1044,7 +1128,9 @@ impl App {
                 self.next_gid = self.next_gid.max(id);
             }
         }
+        let mut restored_ids: Vec<Option<usize>> = vec![]; // by position in the saved list
         for s in v["sessions"].as_array().into_iter().flatten() {
+            restored_ids.push(None);
             let argv: Vec<String> =
                 s["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect();
             let (Some(prog), Some(cwd)) = (argv.first(), s["cwd"].as_str()) else { continue };
@@ -1056,6 +1142,7 @@ impl App {
             let group = s["group"].as_u64().unwrap_or(0) as usize;
             let group = if self.groups.iter().any(|g| g.id == group) { group } else { 0 };
             if let Some(i) = self.spawn(run, cwd, group) {
+                *restored_ids.last_mut().unwrap() = Some(self.sessions[i].id);
                 let restored = &mut self.sessions[i];
                 restored.argv = argv;
                 restored.name = s["name"].as_str().map(String::from);
@@ -1064,6 +1151,12 @@ impl App {
             }
         }
         self.sel = self.visible().first().copied().unwrap_or(0);
+        if let Some(layout) = layout::Node::from_json(&v["layout"], &|k| restored_ids.get(k).copied().flatten()) {
+            // focus the first pane, so what is on screen and what is selected agree
+            let first = layout.leaves()[0];
+            self.layout = layout;
+            self.sel = self.sessions.iter().position(|s| s.id == first).unwrap_or(self.sel);
+        }
     }
 
     fn open_diff(&mut self) {
@@ -1165,7 +1258,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Right) => match hit {
                 Some(Hit::Session(i) | Hit::SessionMenu(i)) => self.press(Some(Hit::SessionMenu(i)), m),
                 Some(Hit::Group(gi) | Hit::GroupMenu(gi)) => self.press(Some(Hit::GroupMenu(gi)), m),
-                Some(Hit::Pane) => self.to_pane(m),
+                Some(Hit::Pane(i)) => self.to_pane(m, i),
                 _ => self.menu = None,
             },
             MouseEventKind::Drag(MouseButton::Left) => self.drag_to(hit, m),
@@ -1173,7 +1266,7 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 match hit {
-                    Some(Hit::Pane) => self.to_pane(m),
+                    Some(Hit::Pane(i)) => self.to_pane(m, i), // scrolls that pane, focused or not
                     Some(Hit::Cards | Hit::Card(_)) => {
                         self.dash_scroll = if up { self.dash_scroll.saturating_sub(1) } else { self.dash_scroll + 1 }
                     }
@@ -1184,8 +1277,11 @@ impl App {
                     }
                 }
             }
-            _ if hit == Some(Hit::Pane) => self.to_pane(m),
-            _ => {}
+            _ => {
+                if let Some(Hit::Pane(i)) = hit {
+                    self.to_pane(m, i);
+                }
+            }
         }
     }
 
@@ -1345,13 +1441,17 @@ impl App {
             }
             Some(Hit::DiffAct(a)) => self.diff_act(a),
             Some(Hit::Card(i)) => self.select(i),
-            Some(Hit::Pane) => {
+            Some(Hit::Pane(i)) => {
+                if i != self.sel {
+                    self.select(i); // clicking a pane focuses it
+                }
                 // where a selection would start; a press that never moves is just a click,
                 // and the agent gets it either way
                 self.picked = Some(((m.column, m.row), (m.column, m.row)));
-                self.drag = Some(Drag { from: Hit::Pane, at: (m.column, m.row), moved: false });
-                self.to_pane(m);
+                self.drag = Some(Drag { from: Hit::Pane(i), at: (m.column, m.row), moved: false });
+                self.to_pane(m, i);
             }
+            Some(h @ Hit::Divider(_)) => self.drag = Some(Drag { from: h, at: (m.column, m.row), moved: false }),
             _ => {}
         }
     }
@@ -1363,10 +1463,18 @@ impl App {
             _ if !d.moved => {}
             Hit::Edge => self.side = (m.column + 1).clamp(24, (self.size.0 / 2).max(24)),
             // dragging over the terminal selects its text rather than reaching the agent
-            Hit::Pane => match &mut self.picked {
+            Hit::Pane(i) => match &mut self.picked {
                 Some((_, to)) => *to = (m.column, m.row),
-                None => self.to_pane(m),
+                None => self.to_pane(m, i),
             },
+            // the panes follow the divider as you drag; terminals are resized once you let go
+            Hit::Divider(k) => {
+                if let Some(div) = self.layout.dividers(self.main_area()).get(k) {
+                    let ratio = layout::ratio_at(div, m.column, m.row);
+                    let path = div.path.clone();
+                    self.layout.set_ratio(&path, ratio);
+                }
+            }
             _ => self.hover = hit,
         }
     }
@@ -1378,16 +1486,17 @@ impl App {
             Hit::Session(i) if !d.moved || hit == Some(Hit::Session(i)) => self.select(i), // a click
             Hit::Session(i) => self.drop_session(i, hit),
             Hit::Edge => {
-                let size = self.pane();
-                for s in &self.sessions {
-                    s.resize(size);
-                }
+                self.apply_layout();
                 self.save();
             }
-            Hit::Pane if d.moved => self.copy_picked(),
-            Hit::Pane => {
+            Hit::Pane(_) if d.moved => self.copy_picked(),
+            Hit::Pane(i) => {
                 self.picked = None;
-                self.to_pane(m);
+                self.to_pane(m, i);
+            }
+            Hit::Divider(_) => {
+                self.apply_layout();
+                self.save();
             }
             _ => {}
         }
@@ -1397,7 +1506,7 @@ impl App {
     /// cell to the later one.
     fn picked_cells(&self) -> Option<((u16, u16), (u16, u16))> {
         let (anchor, to) = self.picked?;
-        let pane = self.hits.iter().find(|(_, h)| *h == Hit::Pane)?.0;
+        let pane = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel))?.0; // the focused pane: drags start there
         let cell = |(x, y): (u16, u16)| {
             (y.clamp(pane.y, pane.bottom() - 1) - pane.y, x.clamp(pane.x, pane.right() - 1) - pane.x)
         };
@@ -1421,9 +1530,9 @@ impl App {
 
     /// Forwards a mouse event to the agent in the pane, or scrolls our scrollback if it
     /// didn't ask for the mouse.
-    fn to_pane(&mut self, m: MouseEvent) {
-        let Some(&(r, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Pane) else { return };
-        let Some(s) = self.sessions.get(self.sel) else { return };
+    fn to_pane(&mut self, m: MouseEvent, i: usize) {
+        let Some(&(r, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Pane(i)) else { return };
+        let Some(s) = self.sessions.get(i) else { return };
         let (col, row) = (m.column.saturating_sub(r.x).min(r.width - 1), m.row.saturating_sub(r.y).min(r.height - 1));
         let mut p = s.parser.lock().unwrap();
         let screen = p.screen();

@@ -145,7 +145,7 @@ impl App {
         // nothing" so iced_term swallows them. Without a binding it types the bare character
         // instead (Ignore falls through to the key's text), which is the old Cmd+V "v" bug.
         // COMMAND is Cmd on macOS and Ctrl on Windows/Linux; the Shift variants are covered too.
-        let keys: Vec<String> = "cv=+-_0123456789tw".chars().map(String::from).collect();
+        let keys: Vec<String> = "cdv=+-_0123456789tw".chars().map(String::from).collect();
         let swallow: Vec<_> = keys
             .iter()
             .flat_map(|c| {
@@ -281,6 +281,8 @@ impl App {
                     "-" | "_" => Some(Message::FontSize(-1.0)),
                     "0" => Some(Message::FontSize(0.0)),
                     "t" | "T" => prefixed(b'n'), // new terminal session
+                    "d" => prefixed(b'|'),       // split side by side, as in iTerm
+                    "D" => prefixed(b'-'),       // ⌘⇧D: split stacked
                     "w" | "W" => prefixed(b'x'), // kill this one (chud asks first)
                     d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => prefixed(d.as_bytes()[0]),
                     _ => None,

@@ -379,8 +379,12 @@ impl Session {
     }
 
     pub fn resize(&self, (rows, cols): (u16, u16)) {
+        let mut p = self.parser.lock().unwrap();
+        if p.screen().size() == (rows, cols) {
+            return; // unchanged: don't make the program redraw for nothing
+        }
         let _ = self.master.resize(size(rows, cols));
-        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+        p.screen_mut().set_size(rows, cols);
     }
 
     pub fn status(&self) -> Status {
