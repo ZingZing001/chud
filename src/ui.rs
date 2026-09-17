@@ -129,7 +129,18 @@ fn fullness(s: &Session) -> f64 {
 }
 
 fn chud_art(s: &Session) -> Vec<Line<'static>> {
-    chud::lines(&chud::sprite(chud::fatness(s.worked()), mood(s.status()), now_secs()))
+    chud::art(&chud::sprite(chud::fatness(s.worked()), mood(s.status()), now_secs()))
+}
+
+/// Block glyphs (▀ ▄ █) only where the font is known to draw them inside their cell: chud.app
+/// bundles one, or you say so with CHUD_MASCOT=blocks. Everywhere else the chud and the bars
+/// are painted with coloured spaces, which no font can get wrong.
+pub fn block_glyphs(term_program: Option<&str>, chud_mascot: Option<&str>) -> bool {
+    match chud_mascot {
+        Some("blocks") => true,
+        Some("safe") => false,
+        _ => term_program == Some("chud-app"),
+    }
 }
 
 /// Draws everything and returns the clickable regions.
@@ -687,6 +698,15 @@ fn prompt(f: &mut Frame, p: &Prompt, hits: &mut Hits) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_glyphs_only_where_they_draw_right() {
+        assert!(super::block_glyphs(Some("chud-app"), None), "chud.app bundles a font that draws them");
+        assert!(!super::block_glyphs(Some("iTerm.app"), None), "unknown font: play safe");
+        assert!(!super::block_glyphs(None, None));
+        assert!(super::block_glyphs(Some("iTerm.app"), Some("blocks")), "you can say your font is fine");
+        assert!(!super::block_glyphs(Some("chud-app"), Some("safe")), "or that it is not");
+    }
+
     #[test]
     fn nerd_icons_only_where_the_font_has_them() {
         assert!(super::nerd_icons(Some("chud-app"), None));

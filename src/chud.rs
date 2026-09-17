@@ -1,7 +1,21 @@
 //! The chud: a cute pixel critter for each session. "Chud" means eating a lot, so it gets
 //! fatter the longer its agent works. Drawn with half-block pixels, like Claude's crab.
 use ratatui::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
+
+/// Draw with background-coloured spaces instead of block glyphs (▀ ▄ █ ▏…). Some fonts paint
+/// those glyphs wider than their cell, over the neighbouring one, which turns a row of chuds
+/// into what looks like several of them piled on each other. A space has nothing to paint.
+static SAFE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_safe(on: bool) {
+    SAFE.store(on, Relaxed);
+}
+
+fn safe() -> bool {
+    SAFE.load(Relaxed)
+}
 
 const BODY: Color = Color::Rgb(0xff, 0xc2, 0x7a);
 const EDGE: Color = Color::Rgb(0xe8, 0x94, 0x4f);
@@ -105,6 +119,11 @@ pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
     px
 }
 
+/// The chud as text, in whichever style this terminal can show (see `set_safe`).
+pub fn art(px: &Pixels) -> Vec<Line<'static>> {
+    if safe() { lines_safe(px) } else { lines(px) }
+}
+
 /// Renders pixels two rows per line: ▀ takes the top pixel's colour, its background the bottom's.
 pub fn lines(px: &Pixels) -> Vec<Line<'static>> {
     px.chunks(2)
@@ -121,7 +140,34 @@ pub fn lines(px: &Pixels) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A `width`-cell progress bar with eighth-cell precision: green, amber past 60%, red past 85%.
+/// Two pixel rows per line again, but painted as spaces, so a line holds one colour per cell,
+/// not two. Where the pair disagrees the more telling pixel wins — an eye over the body, a
+/// mouth over the belly — so the face reads the same and only the outline gets chunkier.
+pub fn lines_safe(px: &Pixels) -> Vec<Line<'static>> {
+    let weight = |c: Option<Color>| match c {
+        None => 0,
+        Some(EYE) => 7,
+        Some(SHINE) => 6,
+        Some(MOUTH) => 5,
+        Some(BLUSH) => 4,
+        Some(EDGE) => 3,
+        Some(BELLY) => 2,
+        Some(_) => 1,
+    };
+    px.chunks(2)
+        .map(|rows| {
+            let cells = (0..rows[0].len()).map(|x| {
+                let (top, bottom) = (rows[0][x], rows.get(1).and_then(|r| r[x]));
+                match if weight(bottom) > weight(top) { bottom } else { top } {
+                    Some(c) => Span::styled(" ", Style::new().bg(c)),
+                    None => Span::raw(" "),
+                }
+            });
+            Line::from(cells.collect::<Vec<_>>())
+        })
+        .collect()
+}
+
 /// A progress bar whose fill runs green → amber → red across its own length, so how full it is
 /// reads from the colour as well as the length. One span per cell; the empty part is one more.
 pub fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
@@ -137,6 +183,16 @@ pub fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
         let mix = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * f).round() as u8;
         Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
     };
+    if safe() {
+        // whole cells only: the eighth-width tips are block glyphs too
+        let filled = (r * width as f64).round() as usize;
+        let mut spans: Vec<Span<'static>> =
+            (0..filled.min(width)).map(|i| Span::styled(" ", Style::new().bg(colour(i)))).collect();
+        if width > spans.len() {
+            spans.push(Span::styled(" ".repeat(width - spans.len()), Style::new().bg(TRACK)));
+        }
+        return spans;
+    }
     let mut spans: Vec<Span<'static>> = (0..full.min(width))
         .map(|i| Span::styled("█", Style::new().fg(colour(i)).bg(TRACK)))
         .collect();
@@ -197,12 +253,46 @@ mod tests {
         assert_eq!(colours.iter().collect::<std::collections::HashSet<_>>().len(), 4, "each cell its own colour");
     }
 
+    /// The safe style draws no glyph a font could smear, keeps the card's five lines, and still
+    /// tells every mood apart — which is the whole point of the chud.
+    #[test]
+    fn safe_style() {
+        let text = |ls: &[Line]| ls.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect::<String>();
+        let moods = [(Mood::Happy, 0), (Mood::Munching, 0), (Mood::Munching, 1), (Mood::Waiting, 0), (Mood::Sleepy, 0)];
+        let mut seen = std::collections::HashSet::new();
+        for fat in 0..=4 {
+            for (mood, frame) in moods {
+                let px = sprite(fat, mood, frame);
+                let ls = lines_safe(&px);
+                assert_eq!(ls.len(), 5, "fits the card's five art lines");
+                assert!(ls.iter().all(|l| l.width() == px[0].len()), "one cell per pixel column");
+                assert!(!text(&ls).contains(['▀', '▄', '█']), "no block glyphs at all");
+                let bgs: Vec<_> = ls.iter().flat_map(|l| l.spans.iter().map(|s| s.style.bg)).collect();
+                assert!(bgs.contains(&Some(EYE)), "{mood:?} fat {fat}: the eyes survive");
+                if fat == 2 {
+                    assert!(seen.insert(format!("{bgs:?}")), "{mood:?} frame {frame} looks like another mood");
+                }
+            }
+        }
+        set_safe(true);
+        let bar_text = bar(0.5, 6).iter().map(|s| s.content.to_string()).collect::<String>();
+        set_safe(false);
+        assert!(!bar_text.contains(['█', '▏', '▌']), "the bar follows the same switch: {bar_text:?}");
+        assert_eq!(bar_text.chars().count(), 6);
+    }
+
     // `cargo test preview -- --nocapture` prints every sprite, for eyeballing the art
     #[test]
     fn preview() {
+        // the safe style, back into the same letters: one line per text row, as it will show
+        let safe = |px: &Pixels| -> String {
+            let as_px: Pixels = lines_safe(px).iter().map(|l| l.spans.iter().map(|s| s.style.bg).collect()).collect();
+            ascii(&as_px)
+        };
         for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy] {
             for fat in [0, 2, 4] {
-                println!("{mood:?} fat {fat}\n{}", ascii(&sprite(fat, mood, 0)));
+                let px = sprite(fat, mood, 0);
+                println!("{mood:?} fat {fat}\n{}safe:\n{}", ascii(&px), safe(&px));
             }
         }
     }

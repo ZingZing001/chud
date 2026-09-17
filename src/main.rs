@@ -296,6 +296,9 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
             Err(_) => break,
         }
     }
+    let var = |k| std::env::var(k).ok();
+    chud::set_safe(!ui::block_glyphs(var("TERM_PROGRAM").as_deref(), var("CHUD_MASCOT").as_deref()));
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     for cmd in &args {
         app.open(cmd);
