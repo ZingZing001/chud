@@ -4,6 +4,7 @@ mod config;
 mod git;
 mod update;
 mod session;
+mod setup;
 mod theme;
 mod ui;
 mod usage;
@@ -111,6 +112,71 @@ enum Hit {
     Cards,
     Pane,
     Backdrop,
+    SetupChoice(usize),
+    SetupBack,
+    SetupNext,
+}
+
+/// The first-start walkthrough, and `chud --setup`: one screen per step, nothing written
+/// until you finish except the status line, which is changed only on its own step and only
+/// when you pick "turn it on".
+pub struct Setup {
+    pub step: usize,
+    /// the highlighted option, on steps that have options
+    pub choice: usize,
+    /// follow the system / always dark / always light
+    pub theme: usize,
+    /// smooth block characters / chunky spaces
+    pub mascot: usize,
+    pub status_line: setup::StatusLine,
+    pub status_result: Option<Result<String, String>>,
+    pub warp: setup::Check,
+    pub gh: setup::Check,
+    pub agents: Vec<(String, bool)>,
+}
+
+pub const SETUP_STEPS: usize = 7;
+const THEMES: [&str; 3] = ["auto", "dark", "light"];
+const MASCOTS: [&str; 2] = ["blocks", "safe"];
+
+impl Setup {
+    fn new(tx: &mpsc::Sender<Event>, cfg: &Value) -> Setup {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::SetupChecks(setup::check_warp(), setup::check_gh()));
+        });
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let settings = std::fs::read_to_string(setup::settings_path(&home)).ok();
+        let settings: Value = settings.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let at = |list: &[&str], key: &str| list.iter().position(|v| cfg[key].as_str() == Some(v));
+        Setup {
+            step: 0,
+            choice: 0,
+            theme: at(&THEMES, "theme").unwrap_or(0),
+            mascot: at(&MASCOTS, "mascot").unwrap_or(chud::safe() as usize),
+            status_line: setup::status_line(&settings),
+            status_result: None,
+            warp: setup::Check::Running,
+            gh: setup::Check::Running,
+            agents: setup::installed(&["claude", "copilot", "codex", "gemini", "aider", "opencode", "amp"]),
+        }
+    }
+
+    /// The options on the current step, if it has any.
+    pub fn choices(&self) -> Vec<String> {
+        let system = if theme::system_light().unwrap_or(false) { "light" } else { "dark" };
+        match self.step {
+            1 => vec![format!("Follow the system (it's {system} right now)"), "Always dark".into(), "Always light".into()],
+            2 => vec!["A · smooth".into(), "B · chunky, works with any font".into()],
+            3 if self.status_result.is_some() => vec![],
+            3 => match &self.status_line {
+                setup::StatusLine::Ours => vec![],
+                setup::StatusLine::Absent => vec!["Turn it on (settings.json is backed up first)".into(), "Not now".into()],
+                setup::StatusLine::Foreign(_) => vec!["Replace it with chud's (backed up first)".into(), "Keep mine".into()],
+            },
+            _ => vec![],
+        }
+    }
 }
 
 /// Menu actions; the numbers are indexes into App.sessions, or App.groups for group actions.
@@ -221,6 +287,7 @@ struct App {
     update: Option<update::Update>,
     /// no theme was chosen, so chud.app may switch it when the system does
     theme_follows: bool,
+    setup: Option<Setup>,
     last_usage: Instant,
     plan: usage::Plan,
     tx: mpsc::Sender<Event>,
@@ -287,6 +354,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         flash: None,
         update: None,
         theme_follows: true,
+        setup: None,
         last_usage: Instant::now(),
         plan: usage::Plan::default(),
         tx,
@@ -311,7 +379,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     app.theme_follows = !matches!(chosen.as_deref(), Some("light" | "dark"));
     theme::set_light(theme::choose(chosen.as_deref(), var("COLORFGBG").as_deref()));
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (flags, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a == "--setup");
     for cmd in &args {
         app.open(cmd);
     }
@@ -320,6 +388,11 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     }
     if app.sessions.is_empty() {
         app.open(DEFAULT_CMD); // like any terminal app: start with a shell
+    }
+    // first start (no config yet), or asked for; CHUD_SETUP=skip is for scripts and tests
+    let skip = std::env::var("CHUD_SETUP").as_deref() == Ok("skip");
+    if !flags.is_empty() || (!config::exists() && !skip) {
+        app.setup = Some(Setup::new(&app.tx, &cfg));
     }
     app.refresh_plan();
     update::watch(app.tx.clone());
@@ -399,6 +472,12 @@ impl App {
             }
             Event::Copilot(quota) => {
                 self.plan.copilot = quota;
+                true
+            }
+            Event::SetupChecks(warp, gh) => {
+                if let Some(s) = &mut self.setup {
+                    (s.warp, s.gh) = (warp, gh);
+                }
                 true
             }
             Event::Updated(u) => {
@@ -528,6 +607,9 @@ impl App {
             KeyCode::F(13 | 14) if self.theme_follows => return theme::set_light(k.code == KeyCode::F(13)),
             KeyCode::F(13 | 14) => return,
             _ => {}
+        }
+        if self.setup.is_some() {
+            return self.setup_key(k);
         }
         if self.help || self.menu.is_some() {
             (self.help, self.menu) = (false, None);
@@ -1074,6 +1156,9 @@ impl App {
 
     fn mouse(&mut self, m: MouseEvent) {
         let hit = self.hit_at(m.column, m.row);
+        if self.setup.is_some() && m.kind != MouseEventKind::Down(MouseButton::Left) {
+            return; // the walkthrough is modal: no scrolling or dragging what is behind it
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.press(hit, m),
             // right-click opens the same menu as a row's … button
@@ -1104,7 +1189,102 @@ impl App {
         }
     }
 
+    fn setup_key(&mut self, k: KeyEvent) {
+        let Some(s) = &self.setup else { return };
+        let (n, at) = (s.choices().len(), s.choice);
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') if n > 0 => self.setup_choose((at + n - 1) % n),
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => self.setup_choose((at + 1) % n),
+            KeyCode::Enter | KeyCode::Right => self.setup_next(),
+            KeyCode::Left | KeyCode::Backspace => self.setup_back(),
+            KeyCode::Esc => self.setup_finish(), // skip the rest, keeping what you picked so far
+            _ => {}
+        }
+    }
+
+    /// Highlight an option; the theme and mascot steps preview it on the spot.
+    fn setup_choose(&mut self, k: usize) {
+        let Some(s) = &mut self.setup else { return };
+        s.choice = k.min(s.choices().len().saturating_sub(1));
+        match s.step {
+            1 => theme::set_light(theme::choose(Some(THEMES[s.choice]), std::env::var("COLORFGBG").ok().as_deref())),
+            2 => chud::set_safe(s.choice == 1),
+            _ => {}
+        }
+    }
+
+    fn setup_next(&mut self) {
+        let Some(s) = &mut self.setup else { return };
+        match s.step {
+            1 => s.theme = s.choice,
+            2 => s.mascot = s.choice,
+            // the one step that changes a file outside chud: act on the choice, then stay to
+            // show what happened; the next Enter moves on
+            3 if !s.choices().is_empty() => {
+                s.status_result = Some(match s.choice {
+                    0 => {
+                        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+                        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or("chud".into());
+                        let replace = matches!(s.status_line, setup::StatusLine::Foreign(_));
+                        setup::enable_status_line(&home, &exe, replace)
+                    }
+                    _ => Err("Left as it is. Context bars and usage limits stay off until you run chud --setup.".into()),
+                });
+                s.choice = 0;
+                return;
+            }
+            _ if s.step + 1 >= SETUP_STEPS => return self.setup_finish(),
+            _ => {}
+        }
+        s.step += 1;
+        s.choice = match s.step {
+            1 => s.theme,
+            2 => s.mascot,
+            _ => 0,
+        };
+        let k = s.choice;
+        self.setup_choose(k);
+    }
+
+    fn setup_back(&mut self) {
+        let Some(s) = &mut self.setup else { return };
+        if s.step == 0 {
+            return;
+        }
+        s.step -= 1;
+        let k = match s.step {
+            1 => s.theme,
+            2 => s.mascot,
+            _ => 0,
+        };
+        self.setup_choose(k);
+    }
+
+    /// Saves your choices into config.json, keeping anything else in it (your agents), and
+    /// applies them to this run.
+    fn setup_finish(&mut self) {
+        let Some(s) = self.setup.take() else { return };
+        let mut cfg = config::load();
+        cfg["version"] = json!(1);
+        cfg["theme"] = json!(THEMES[s.theme]);
+        cfg["mascot"] = json!(MASCOTS[s.mascot]);
+        config::save(&cfg);
+        self.theme_follows = s.theme == 0;
+        theme::set_light(theme::choose(Some(THEMES[s.theme]), std::env::var("COLORFGBG").ok().as_deref()));
+        chud::set_safe(s.mascot == 1);
+        self.flash = Some(format!(" setup saved to {} · run chud --setup to change it ", config::path().display()));
+    }
+
     fn press(&mut self, hit: Option<Hit>, m: MouseEvent) {
+        if self.setup.is_some() {
+            match hit {
+                Some(Hit::SetupChoice(k)) => self.setup_choose(k),
+                Some(Hit::SetupNext) => self.setup_next(),
+                Some(Hit::SetupBack) => self.setup_back(),
+                _ => {}
+            }
+            return;
+        }
         if self.help {
             self.help = false;
             return;

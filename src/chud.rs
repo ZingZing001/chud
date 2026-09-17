@@ -13,7 +13,7 @@ pub fn set_safe(on: bool) {
     SAFE.store(on, Relaxed);
 }
 
-fn safe() -> bool {
+pub fn safe() -> bool {
     SAFE.load(Relaxed)
 }
 

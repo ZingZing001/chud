@@ -3,11 +3,12 @@ use crate::session::{Agent, Session, Status};
 use crate::theme::p as pal;
 use crate::update::Update;
 use crate::usage::{local_minute, now_secs, Plan, Window};
-use crate::{App, Ask, Diff, DiffAct, Drag, Hit, Menu, Prompt, Row, Tool};
+use crate::setup::{Check, StatusLine};
+use crate::{App, Ask, Diff, DiffAct, Drag, Hit, Menu, Prompt, Row, Setup, Tool, SETUP_STEPS};
 use ratatui::prelude::*;
 use ratatui::symbols::Marker;
 use ratatui::widgets::{
-    Axis, Bar, BarChart, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
+    Axis, Bar, BarChart, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph, Wrap,
 };
 use std::time::Duration;
 use tui_term::widget::{Cursor, PseudoTerminal};
@@ -174,7 +175,151 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
     if let Some(p) = &app.prompt {
         prompt(f, p, &mut hits);
     }
+    if let Some(s) = &app.setup {
+        setup(f, s, &mut hits);
+    }
     hits
+}
+
+/// The walkthrough: one centred box per step, options to arrow through or click, and Back /
+/// Next buttons. Everything behind it stays visible but out of reach.
+fn setup(f: &mut Frame, s: &Setup, hits: &mut Hits) {
+    let a = f.area();
+    hits.push((a, Hit::Backdrop));
+    let (w, h) = (76.min(a.width.saturating_sub(4)), 22.min(a.height.saturating_sub(2)));
+    let r = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
+    f.render_widget(Clear, r);
+    let titles = ["Welcome", "Theme", "Your chud", "Context and usage", "Seeing Claude work", "Your agents", "All set"];
+    let block = Block::bordered()
+        .border_style(pal().accent)
+        .title(Line::from(format!(" chud setup · {} ", titles[s.step])).bold())
+        .title_bottom(Line::from(format!(" {} of {} ", s.step + 1, SETUP_STEPS)).right_aligned().fg(pal().dim));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let inner = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height);
+
+    let choices = s.choices();
+    let [body, list, _, buttons] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(choices.len() as u16),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let dim = |t: String| Line::from(t.fg(pal().dim));
+    let ok = |t: &str| Line::from(vec!["✓ ".green().bold(), t.to_string().into()]);
+    let check = |c: &Check| match c {
+        Check::Running => dim("… checking".into()),
+        Check::Ok(t) => ok(t),
+        Check::Missing(t) => Line::from(vec!["✗ ".yellow().bold(), t.clone().into()]),
+    };
+    let mut lines: Vec<Line> = vec![Line::default()];
+    match s.step {
+        0 => lines.extend([
+            Line::from("chud runs your coding agents side by side and tells you which one needs you."),
+            Line::default(),
+            Line::from("This takes about thirty seconds: how chud looks, and the Claude Code settings behind its context bars and usage limits."),
+            Line::default(),
+            Line::from("Nothing outside chud changes unless you pick it here. Run this again any time with chud --setup."),
+            Line::default(),
+            dim("Enter to start · Esc to skip".into()),
+        ]),
+        1 => lines.extend([Line::from("How should chud look?"), Line::default(), dim("Moving through the options previews them.".into())]),
+        2 => {
+            lines.push(Line::from("Which chud looks right to you?"));
+            lines.push(Line::default());
+            let px = chud::sprite(2, Mood::Happy, 0);
+            let (smooth, chunky) = (chud::lines(&px), chud::lines_safe(&px));
+            let gap = || Span::raw("      ");
+            for (a, b) in smooth.into_iter().zip(chunky) {
+                let mut spans = vec![Span::raw("   ")];
+                spans.extend(a.spans);
+                spans.push(gap());
+                spans.extend(b.spans);
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(format!("   {:^14}      {:^14}", "A", "B")).bold());
+            lines.push(Line::default());
+            lines.push(dim("If A looks like several chuds piled on each other, your font draws block characters too wide: pick B.".into()));
+        }
+        3 => {
+            lines.push(Line::from("Claude Code reports each session's context size and your plan's limits through its status line. chud reads them from there."));
+            lines.push(Line::default());
+            lines.push(match (&s.status_result, &s.status_line) {
+                (Some(Ok(t)), _) => ok(t),
+                (Some(Err(t)), _) => Line::from(vec!["• ".yellow().bold(), t.clone().into()]),
+                (None, StatusLine::Ours) => ok("Already on: Claude Code reports to chud."),
+                (None, StatusLine::Absent) => Line::from("It isn't on yet. Turning it on adds one entry to ~/.claude/settings.json and keeps everything else."),
+                (None, StatusLine::Foreign(cmd)) => Line::from(format!("Your status line runs `{cmd}`. chud can take its place, or you can keep yours.")),
+            });
+        }
+        4 => {
+            lines.push(Line::from("chud knows when Claude is working, done or waiting on you through the claude-code-warp plugin."));
+            lines.push(Line::default());
+            lines.push(check(&s.warp));
+            if matches!(s.warp, Check::Missing(_)) {
+                lines.push(Line::default());
+                lines.push(Line::from("To install it, run these in any terminal:"));
+                lines.push(Line::from("  claude plugin marketplace add warpdotdev/claude-code-warp".fg(pal().accent)));
+                lines.push(Line::from("  claude plugin install warp@claude-code-warp".fg(pal().accent)));
+            }
+        }
+        5 => {
+            lines.push(Line::from("Agents on this machine:"));
+            lines.push(Line::default());
+            let mut row = vec![Span::raw("  ")];
+            for (name, found) in &s.agents {
+                row.push(if *found { format!("✓ {name}   ").green() } else { format!("· {name}   ").fg(pal().dim) });
+            }
+            lines.push(Line::from(row));
+            lines.push(Line::default());
+            lines.push(check(&s.gh));
+            lines.push(Line::default());
+            lines.push(dim("Using another harness? Add it under \"agents\" in ~/.config/chud/config.json.".into()));
+        }
+        _ => {
+            let status = match (&s.status_result, &s.status_line) {
+                (Some(Ok(_)), _) | (None, StatusLine::Ours) => "on",
+                _ => "off",
+            };
+            lines.extend([
+                Line::from("You're set."),
+                Line::default(),
+                Line::from(format!("  Theme         {}", ["follows the system", "always dark", "always light"][s.theme])),
+                Line::from(format!("  Chud          {}", ["smooth", "chunky"][s.mascot])),
+                Line::from(format!("  Status line   {status}")),
+                Line::default(),
+                dim("Enter to finish. Change any of this later with chud --setup.".into()),
+            ]);
+        }
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+
+    for (i, text) in choices.iter().enumerate() {
+        let row = Rect::new(list.x, list.y + i as u16, list.width, 1);
+        let line = if i == s.choice {
+            Line::from(vec!["▶ ".fg(pal().accent).bold(), text.clone().bold()])
+        } else {
+            Line::from(vec!["  ".into(), text.clone().into()])
+        };
+        f.render_widget(line, row);
+        hits.push((row, Hit::SetupChoice(i)));
+    }
+
+    let applies = s.step == 3 && !choices.is_empty();
+    let next = if s.step + 1 >= SETUP_STEPS { " Finish " } else if applies { " Apply › " } else { " Next › " };
+    let next_w = next.chars().count() as u16;
+    let next_r = Rect::new(buttons.right().saturating_sub(next_w), buttons.y, next_w, 1);
+    f.render_widget(next.fg(pal().on_accent).bg(pal().accent).bold(), next_r);
+    hits.push((next_r, Hit::SetupNext));
+    if s.step > 0 {
+        let back = " ‹ Back ";
+        let back_w = back.chars().count() as u16;
+        let back_r = Rect::new(next_r.x.saturating_sub(back_w + 2), buttons.y, back_w, 1);
+        f.render_widget(back.fg(pal().bar_fg).bg(pal().button_bg), back_r);
+        hits.push((back_r, Hit::SetupBack));
+    }
 }
 
 /// One line above the terminal: what's running in it and, for an agent, your plan's usage:
@@ -653,6 +798,7 @@ const HELP: &[(&str, &str)] = &[
     ("C-a x", "kill session"),
     ("C-a q", "quit; running `chud` alone restores the layout"),
     ("C-a C-a", "send a literal Ctrl-a"),
+    ("chud --setup", "run the first-start walkthrough again"),
 ];
 
 fn help(f: &mut Frame) {

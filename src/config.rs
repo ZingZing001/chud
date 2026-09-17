@@ -14,6 +14,14 @@ pub fn load() -> Value {
     text.and_then(|t| serde_json::from_str(&t).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}))
 }
 
+pub fn exists() -> bool {
+    path().exists()
+}
+
+pub fn save(v: &Value) {
+    write_atomic(&path(), &(serde_json::to_string_pretty(v).unwrap_or_default() + "\n"));
+}
+
 /// A setting as text: the environment wins (CHUD_THEME, CHUD_MASCOT — handy for trying things),
 /// then the config file.
 pub fn setting(cfg: &Value, key: &str, env: &str) -> Option<String> {

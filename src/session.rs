@@ -25,6 +25,8 @@ pub enum Event {
     Copilot(Option<(usage::Window, u64)>),
     /// a newer chud was pulled and built, or the attempt failed
     Updated(crate::update::Update),
+    /// the walkthrough's background checks: the warp plugin, then gh
+    SetupChecks(crate::setup::Check, crate::setup::Check),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

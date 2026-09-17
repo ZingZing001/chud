@@ -14,6 +14,8 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 |---|---|
 | **Live agent status** | Working, needs input, done, or exited, for Claude Code and Copilot CLI. It also picks up agents you start by hand inside a shell session. |
 | **Notifications & unread markers** | A macOS notification when an agent finishes or asks for input; a marker on sessions you haven't looked at since. |
+| **Any agent** | Codex, Gemini CLI, aider, opencode and amp out of the box; add your own harness in `config.json`. |
+| **Light and dark** | Follows the system theme, live in chud.app. |
 | **Plan usage header** | Claude's rolling 5-hour limit with a reset countdown plus the weekly %, or Copilot's monthly premium requests. |
 | **Context fullness** | Per-session bar in the sidebar showing how full each agent's context window is. |
 | **Groups** | Put sessions in named, foldable groups; drag sessions to reorder or regroup them. |
@@ -47,31 +49,37 @@ Re-run [`bundle.sh`](bundle.sh) after any code change. If you only want the term
 cargo install --path .   # puts `chud` in ~/.cargo/bin
 ```
 
-### 2. Let chud see Claude's status
+### 2. First start
 
-Claude Code reports its status through the `claude-code-warp` plugin, which chud listens for:
+The first time chud opens, it walks you through setup. It takes about thirty seconds:
 
-```sh
-claude plugin marketplace add warpdotdev/claude-code-warp
-claude plugin install warp@claude-code-warp
-```
+- **Theme**: follow the system, or always dark or light. It previews as you choose.
+- **Your chud**: pick whichever mascot drawing looks right in your font.
+- **Context and usage**: turns on Claude Code's status line, which feeds chud each session's context size and your plan's limits. It backs up `~/.claude/settings.json` first, keeps every other setting, and never replaces a status line you already use without asking.
+- **Checks**: whether the `claude-code-warp` plugin is installed (chud uses it to see Claude working) and whether `gh` is logged in (for Copilot's quota). If the plugin is missing, the walkthrough shows how to install it:
 
-Copilot CLI needs no setup.
+  ```sh
+  claude plugin marketplace add warpdotdev/claude-code-warp
+  claude plugin install warp@claude-code-warp
+  ```
 
-### 3. Show Claude's 5-hour limit (optional)
+Run `chud --setup` to go through it again. Your choices live in `~/.config/chud/config.json`.
 
-Add a status line to `~/.claude/settings.json`. After each reply, Claude Code hands chud your plan limits:
+### 3. Other agents (optional)
+
+Codex, Gemini CLI, aider, opencode and amp are recognised out of the box. They get an icon, a colour, a chud and a status. For any other agent or your own harness, add it to `config.json`:
 
 ```json
 {
-  "statusLine": {
-    "type": "command",
-    "command": "~/Applications/chud.app/Contents/MacOS/chud --statusline"
-  }
+  "agents": [
+    { "name": "my-harness", "match": ["my-harness"], "icon": "◆", "color": "#7ac2ff" }
+  ]
 }
 ```
 
-Use `~/.cargo/bin/chud --statusline` if you installed with `cargo install`. This also gives every Claude Code session a one-line footer like `5h 23% · week 41%`, which replaces Claude's default key hints. The limits only appear on Claude Pro/Max plans, starting from the first reply.
+Status comes from the agent's own signals when it sends them, and otherwise from its activity: working while output flows after you press Enter, done once it goes quiet. Context bars and plan usage are Claude and Copilot only, because their logs have known formats.
+
+Environment overrides, handy for scripts: `CHUD_THEME=light|dark`, `CHUD_MASCOT=blocks|safe`, `CHUD_SETUP=skip`.
 
 ## Usage
 
