@@ -1,5 +1,6 @@
 use crate::chud::{self, Mood};
 use crate::session::{Agent, Session, Status};
+use crate::theme::p as pal;
 use crate::update::Update;
 use crate::usage::{local_minute, now_secs, Plan, Window};
 use crate::{App, Ask, Diff, DiffAct, Drag, Hit, Menu, Prompt, Row, Tool};
@@ -14,14 +15,6 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 /// Clickable regions from the last draw, topmost last.
 pub type Hits = Vec<(Rect, Hit)>;
 
-const PEACH: Color = Color::Rgb(0xff, 0xc2, 0x7a);
-const CLAUDE: Color = Color::Rgb(0xd9, 0x77, 0x57);
-const COPILOT: Color = Color::Rgb(0xa3, 0x71, 0xf7);
-const DIM: Color = Color::Rgb(0x6c, 0x6c, 0x78);
-const BAR_BG: Color = Color::Rgb(0x1e, 0x1e, 0x26);
-const BUTTON: Color = Color::Rgb(0x2e, 0x2e, 0x38);
-const DROP: Color = Color::Rgb(0x3b, 0x3b, 0x5c);
-const SELECTED: Color = Color::Rgb(0x2c, 0x2a, 0x40); // the dim second line stays readable on it
 const CARD_W: u16 = 24;
 const CARD_H: u16 = 10;
 
@@ -68,8 +61,8 @@ fn icon(agent: &Agent) -> Span<'static> {
     });
     let pick = |glyph, fallback| if nerd { glyph } else { fallback };
     match agent {
-        Agent::Claude => Span::styled(pick("\u{ec82} ", "✳ "), CLAUDE),
-        Agent::Copilot => Span::styled(pick("\u{ec1e} ", "◆ "), COPILOT),
+        Agent::Claude => Span::styled(pick("\u{ec82} ", "✳ "), pal().claude),
+        Agent::Copilot => Span::styled(pick("\u{ec1e} ", "◆ "), pal().copilot),
         Agent::Shell => pick("\u{e795} ", "❯ ").gray(),
         Agent::Other(_) => pick("\u{e795} ", "❯ ").dark_gray(),
     }
@@ -77,8 +70,8 @@ fn icon(agent: &Agent) -> Span<'static> {
 
 fn agent_color(agent: &Agent) -> Color {
     match agent {
-        Agent::Claude => CLAUDE,
-        Agent::Copilot => COPILOT,
+        Agent::Claude => pal().claude,
+        Agent::Copilot => pal().copilot,
         _ => Color::Gray,
     }
 }
@@ -165,7 +158,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
         picked(f, app, term);
         hits.push((term, Hit::Pane));
     } else {
-        f.render_widget(Paragraph::new(" No sessions yet. Click + New, or press Ctrl-a n.").fg(DIM), main);
+        f.render_widget(Paragraph::new(" No sessions yet. Click + New, or press Ctrl-a n.").fg(pal().dim), main);
     }
     status_bar(f, app, bar);
     if let Some(m) = &app.menu {
@@ -198,19 +191,19 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect) {
                     spans.push(Span::raw("5h limit "));
                     spans.extend(bar(h));
                     spans.push(format!(" {:.0}%", h.used).into());
-                    spans.push(format!("  resets in {}", until(h.resets_at)).fg(DIM));
+                    spans.push(format!("  resets in {}", until(h.resets_at)).fg(pal().dim));
                     if let Some(w) = plan.seven_day {
-                        spans.push(format!(" · week {:.0}%", w.used).fg(DIM));
+                        spans.push(format!(" · week {:.0}%", w.used).fg(pal().dim));
                     }
                 }
                 (false, _, Some((q, total))) => {
                     spans.push(Span::raw("premium requests "));
                     spans.extend(bar(q));
                     spans.push(format!(" {:.0}% of {total}", q.used).into());
-                    spans.push(format!("  resets in {}", until(q.resets_at)).fg(DIM));
+                    spans.push(format!("  resets in {}", until(q.resets_at)).fg(pal().dim));
                 }
-                (true, None, _) => spans.push("5h limit shows after Claude's next reply".fg(DIM)),
-                (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(DIM)),
+                (true, None, _) => spans.push("5h limit shows after Claude's next reply".fg(pal().dim)),
+                (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(pal().dim)),
             }
         }
         Agent::Shell | Agent::Other(_) => {
@@ -218,14 +211,14 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect) {
                 Agent::Other(name) => name.clone(),
                 _ => s.argv[0].rsplit('/').next().unwrap_or("shell").to_string(),
             };
-            spans.push(format!("{program} · {}", s.cwd.display()).fg(DIM));
+            spans.push(format!("{program} · {}", s.cwd.display()).fg(pal().dim));
         }
     }
-    f.render_widget(Line::from(spans).bg(BAR_BG), area);
+    f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), area);
 }
 
 fn toolbar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
-    let mut spans = vec![" chud ".fg(Color::Black).bg(PEACH).bold(), " ".into()];
+    let mut spans = vec![" chud ".fg(pal().on_accent).bg(pal().accent).bold(), " ".into()];
     let mut x = area.x + 7;
     let buttons = [
         (" + New ▾ ", Tool::New, false),
@@ -236,7 +229,7 @@ fn toolbar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     for (text, tool, on) in buttons {
         let w = text.chars().count() as u16;
         hits.push((Rect::new(x, area.y, w, 1), Hit::Tool(tool)));
-        spans.push(if on { text.fg(Color::Black).bg(PEACH) } else { text.fg(Color::White).bg(BUTTON) });
+        spans.push(if on { text.fg(pal().on_accent).bg(pal().accent) } else { text.fg(pal().bar_fg).bg(pal().button_bg) });
         spans.push(" ".into());
         x += w + 1;
     }
@@ -245,7 +238,7 @@ fn toolbar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         format!("● {} working  ", count(Status::Working)).yellow(),
         format!("◐ {} need you ", count(Status::NeedsInput)).magenta(),
     ]);
-    f.render_widget(Line::from(spans).bg(BAR_BG), area);
+    f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), area);
     f.render_widget(right.right_aligned(), area);
 }
 
@@ -271,14 +264,14 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             };
             // a base style, not List's highlight_style: that paints over the chud's pixel colours
             match row {
-                _ if dragging && app.hover == Some(target) => item.style(Style::new().bg(DROP)),
-                Row::Session(i) if i == app.sel => item.style(Style::new().bg(SELECTED)),
+                _ if dragging && app.hover == Some(target) => item.style(Style::new().fg(pal().bar_fg).bg(pal().drop_bg)),
+                Row::Session(i) if i == app.sel => item.style(Style::new().fg(pal().bar_fg).bg(pal().selected_bg)),
                 _ => item,
             }
         })
         .collect();
     let mut state = ListState::default().with_selected(selected);
-    let border = Block::new().borders(Borders::RIGHT).border_style(Style::new().fg(if edge { PEACH } else { DIM }));
+    let border = Block::new().borders(Borders::RIGHT).border_style(Style::new().fg(if edge { pal().accent } else { pal().dim }));
     let list = List::new(items).block(border);
     f.render_stateful_widget(list, area, &mut state);
 
@@ -297,7 +290,7 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         };
         hits.push((rect, item));
         let dots = Rect::new(right.saturating_sub(2), y, 2, 1);
-        f.render_widget(Span::from("…").fg(DIM), dots);
+        f.render_widget(Span::from("…").fg(pal().dim), dots);
         hits.push((dots, menu));
         y += h;
     }
@@ -344,11 +337,11 @@ fn session_item(s: &Session, num: usize, headers: bool) -> ListItem<'static> {
     let mut second = vec![Span::raw(format!("{pad}    "))];
     if is_agent(s) {
         second.extend(chud::bar(fullness(s), 8));
-        second.push(format!(" {:>3.0}% ", fullness(s) * 100.0).fg(DIM));
+        second.push(format!(" {:>3.0}% ", fullness(s) * 100.0).fg(pal().dim));
     } else {
-        second.push(format!("{} · ", s.folder()).fg(DIM));
+        second.push(format!("{} · ", s.folder()).fg(pal().dim));
     }
-    second.push(detail.fg(DIM));
+    second.push(detail.fg(pal().dim));
     ListItem::new(vec![Line::from(first), Line::from(second)])
 }
 
@@ -367,7 +360,7 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
 
     let munched: Duration = app.sessions.iter().map(|s| s.worked()).sum();
     let intro = format!("  {} sessions · {} of munching · numbers come from each agent's own log", order.len(), elapsed(munched));
-    f.render_widget(Line::from(vec![" Summary ".fg(Color::Black).bg(PEACH).bold(), intro.fg(DIM)]), head);
+    f.render_widget(Line::from(vec![" Summary ".fg(pal().on_accent).bg(pal().accent).bold(), intro.fg(pal().dim)]), head);
 
     let count = |st| app.sessions.iter().filter(|s| s.status() == st).count();
     let (eaten, produced, credits) = app.sessions.iter().fold((0, 0, 0.0), |(e, p, c), s| {
@@ -377,14 +370,14 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         (count(Status::Working).to_string(), "working", Color::Yellow),
         (count(Status::NeedsInput).to_string(), "need you", Color::Magenta),
         (count(Status::Done).to_string(), "done", Color::Green),
-        (tokens(eaten), "tokens eaten", PEACH),
+        (tokens(eaten), "tokens eaten", pal().accent),
         (tokens(produced), "produced", Color::Cyan),
-        (format!("{credits:.1}"), "copilot credits", COPILOT),
+        (format!("{credits:.1}"), "copilot credits", pal().copilot),
     ];
     let boxes: [Rect; 6] = Layout::horizontal([Constraint::Fill(1); 6]).spacing(1).areas(tiles);
     for ((value, what, color), r) in tile_data.into_iter().zip(boxes) {
-        let text = Line::from(vec![value.fg(color).bold(), format!(" {what}").fg(DIM)]);
-        f.render_widget(Paragraph::new(text).centered().block(Block::bordered().border_style(DIM)), r);
+        let text = Line::from(vec![value.fg(color).bold(), format!(" {what}").fg(pal().dim)]);
+        f.render_widget(Paragraph::new(text).centered().block(Block::bordered().border_style(pal().dim)), r);
     }
 
     let [line_area, bar_area] =
@@ -405,10 +398,10 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let line = |name, data, color| {
         Dataset::default().name(name).marker(Marker::Braille).graph_type(GraphType::Line).style(color).data(data)
     };
-    let chart = Chart::new(vec![line("claude", &points[0], CLAUDE), line("copilot", &points[1], COPILOT)])
-        .block(Block::bordered().title(" tokens produced · last 2 hours ").border_style(DIM))
-        .x_axis(Axis::default().bounds([0.0, 59.0]).labels(["-2h", "-1h", "now"]).style(DIM))
-        .y_axis(Axis::default().bounds([0.0, peak as f64]).labels(["0".into(), tokens(peak / 2), tokens(peak)]).style(DIM));
+    let chart = Chart::new(vec![line("claude", &points[0], pal().claude), line("copilot", &points[1], pal().copilot)])
+        .block(Block::bordered().title(" tokens produced · last 2 hours ").border_style(pal().dim))
+        .x_axis(Axis::default().bounds([0.0, 59.0]).labels(["-2h", "-1h", "now"]).style(pal().dim))
+        .y_axis(Axis::default().bounds([0.0, peak as f64]).labels(["0".into(), tokens(peak / 2), tokens(peak)]).style(pal().dim));
     f.render_widget(chart, line_area);
 
     let mut eaters: Vec<(String, u64, Color)> = order
@@ -425,7 +418,7 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             Bar::with_label(name, v).text_value(tokens(v)).style(c).value_style(Style::new().fg(Color::Black).bg(c))
         })
         .collect();
-    let block = Block::bordered().title(" who ate the most ").border_style(DIM);
+    let block = Block::bordered().title(" who ate the most ").border_style(pal().dim);
     f.render_widget(BarChart::horizontal(bars).bar_width(1).bar_gap(0).block(block), bar_area);
 
     activity(f, app, heat);
@@ -460,7 +453,7 @@ fn picked(f: &mut Frame, app: &App, term: Rect) {
 /// A week of work at a glance: one row per day, one tile per hour, each tile shaded by how
 /// many tokens the agents produced in that hour. Empty hours stay dark.
 fn activity(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered().title(" activity · tokens produced per hour ").border_style(DIM);
+    let block = Block::bordered().title(" activity · tokens produced per hour ").border_style(pal().dim);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 2 {
@@ -480,12 +473,13 @@ fn activity(f: &mut Frame, app: &App, area: Rect) {
     }
     let peak = grid.iter().flatten().copied().max().unwrap_or(0).max(1);
     let shade = |t: u64| match t {
-        0 => Color::Rgb(0x26, 0x26, 0x2e),
+        0 => pal().heat_empty,
         // four steps, like a contribution graph: the lightest still reads against the empties
         t => {
             let step = (t * 4).div_ceil(peak).clamp(1, 4) as u8;
-            let f = |from: u8, to: u8| from + (to - from) / 4 * step;
-            Color::Rgb(f(0x4a, 0xff), f(0x3a, 0xc2), f(0x2a, 0x7a))
+            let (lo, hi) = (pal().heat_low, pal().heat_high);
+            let f = |from: u8, to: u8| (from as i16 + (to as i16 - from as i16) * step as i16 / 4) as u8;
+            Color::Rgb(f(lo.0, hi.0), f(lo.1, hi.1), f(lo.2, hi.2))
         }
     };
     let mut lines: Vec<Line> = grid
@@ -494,17 +488,17 @@ fn activity(f: &mut Frame, app: &App, area: Rect) {
         .map(|(row, hours)| {
             let day = first + row as u64;
             let name = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][((day + 4) % 7) as usize];
-            let mut spans = vec![format!("{name} ").fg(DIM)];
+            let mut spans = vec![format!("{name} ").fg(pal().dim)];
             spans.extend(hours.iter().map(|&t| Span::styled("██", Style::new().fg(shade(t)))));
-            spans.push(format!(" {}", tokens(hours.iter().sum())).fg(DIM));
+            spans.push(format!(" {}", tokens(hours.iter().sum())).fg(pal().dim));
             Line::from(spans)
         })
         .collect();
     let mut axis = vec![Span::raw("    ")];
-    axis.extend((0..24).step_by(6).map(|h| format!("{h:02}          ").fg(DIM)));
-    axis.push(" less ".fg(DIM));
+    axis.extend((0..24).step_by(6).map(|h| format!("{h:02}          ").fg(pal().dim)));
+    axis.push(" less ".fg(pal().dim));
     axis.extend([1, peak / 3, peak * 2 / 3, peak].map(|t| Span::styled("█", Style::new().fg(shade(t)))));
-    axis.push(" more".fg(DIM));
+    axis.push(" more".fg(pal().dim));
     lines.push(Line::from(axis));
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -512,7 +506,7 @@ fn activity(f: &mut Frame, app: &App, area: Rect) {
 fn card(f: &mut Frame, s: &Session, selected: bool, r: Rect) {
     let st = s.status();
     let title = Line::from(vec![" ".into(), icon(&s.agent), badge(st)]);
-    let block = Block::bordered().title(title).border_style(if selected { PEACH } else { DIM });
+    let block = Block::bordered().title(title).border_style(if selected { pal().accent } else { pal().dim });
     let inner = block.inner(r);
     f.render_widget(block, r);
     let mut lines: Vec<Line> = chud_art(s).into_iter().map(Line::centered).collect();
@@ -524,13 +518,13 @@ fn card(f: &mut Frame, s: &Session, selected: bool, r: Rect) {
         bar.push(format!(" {:>3.0}%", p * 100.0).into());
         lines.push(Line::from(bar).centered());
     } else {
-        lines.push(Line::from(s.folder().fg(DIM)).centered());
+        lines.push(Line::from(s.folder().fg(pal().dim)).centered());
     }
     let stats = match s.working_since {
         Some(t) => format!("munching {}", elapsed(t.elapsed())),
         None => format!("{} · ate {}", label(st), elapsed(s.worked())),
     };
-    lines.push(Line::from(stats.fg(DIM)).centered());
+    lines.push(Line::from(stats.fg(pal().dim)).centered());
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -546,7 +540,7 @@ fn diff(f: &mut Frame, d: &Diff, area: Rect, hits: &mut Hits) {
     ] {
         let w = text.chars().count() as u16;
         hits.push((Rect::new(x, actions.y, w, 1), Hit::DiffAct(act)));
-        spans.extend([text.fg(Color::White).bg(BUTTON), " ".into()]);
+        spans.extend([text.fg(pal().bar_fg).bg(pal().button_bg), " ".into()]);
         x += w + 1;
     }
     f.render_widget(Line::from(spans), actions);
@@ -587,7 +581,7 @@ fn diff(f: &mut Frame, d: &Diff, area: Rect, hits: &mut Hits) {
 
 fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     if let Some(flash) = &app.flash {
-        f.render_widget(Line::from(flash.as_str().black().on_green()).bg(BAR_BG), area);
+        f.render_widget(Line::from(flash.as_str().black().on_green()).fg(pal().bar_fg).bg(pal().bar_bg), area);
         return;
     }
     let keys = match &app.drag {
@@ -609,7 +603,7 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         Some(Update::Failed(why)) => spans.push(format!(" ⟳ update failed: {why} ").black().on_red()),
         None => {}
     }
-    f.render_widget(Line::from(spans).bg(BAR_BG), area);
+    f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), area);
 }
 
 fn menu(f: &mut Frame, m: &Menu, hits: &mut Hits) {
@@ -617,7 +611,7 @@ fn menu(f: &mut Frame, m: &Menu, hits: &mut Hits) {
     let w = m.items.iter().map(|(l, _)| l.chars().count() as u16).max().unwrap_or(0) + 4;
     let h = m.items.len() as u16 + 2;
     let r = Rect::new(m.x.min(a.width.saturating_sub(w)), m.y.min(a.height.saturating_sub(h)), w.min(a.width), h.min(a.height));
-    let block = Block::bordered().border_style(PEACH);
+    let block = Block::bordered().border_style(pal().accent);
     let inner = block.inner(r);
     f.render_widget(Clear, r);
     f.render_widget(block, r);
@@ -690,8 +684,8 @@ fn prompt(f: &mut Frame, p: &Prompt, hits: &mut Hits) {
     let y = r.bottom().saturating_sub(1);
     let cancel_r = Rect::new(r.right().saturating_sub(cancel.len() as u16 + 2), y, cancel.len() as u16, 1);
     let ok_r = Rect::new(cancel_r.x.saturating_sub(ok.len() as u16 + 1), y, ok.len() as u16, 1);
-    f.render_widget(ok.fg(Color::Black).bg(PEACH), ok_r);
-    f.render_widget(cancel.fg(Color::White).bg(BUTTON), cancel_r);
+    f.render_widget(ok.fg(pal().on_accent).bg(pal().accent), ok_r);
+    f.render_widget(cancel.fg(pal().bar_fg).bg(pal().button_bg), cancel_r);
     hits.push((ok_r, Hit::Ok));
     hits.push((cancel_r, Hit::Cancel));
 }

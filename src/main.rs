@@ -2,6 +2,7 @@ mod chud;
 mod git;
 mod update;
 mod session;
+mod theme;
 mod ui;
 mod usage;
 
@@ -216,6 +217,8 @@ struct App {
     flash: Option<String>,
     /// a rebuilt chud is installed and waiting for a restart
     update: Option<update::Update>,
+    /// no theme was chosen, so chud.app may switch it when the system does
+    theme_follows: bool,
     last_usage: Instant,
     plan: usage::Plan,
     tx: mpsc::Sender<Event>,
@@ -281,6 +284,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         resized: false,
         flash: None,
         update: None,
+        theme_follows: true,
         last_usage: Instant::now(),
         plan: usage::Plan::default(),
         tx,
@@ -298,6 +302,9 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     }
     let var = |k| std::env::var(k).ok();
     chud::set_safe(!ui::block_glyphs(var("TERM_PROGRAM").as_deref(), var("CHUD_MASCOT").as_deref()));
+    let chosen = var("CHUD_THEME");
+    app.theme_follows = !matches!(chosen.as_deref(), Some("light" | "dark"));
+    theme::set_light(theme::choose(chosen.as_deref(), var("COLORFGBG").as_deref()));
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     for cmd in &args {
@@ -502,9 +509,13 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
-        // chud.app sends F15 for ⌘C, a key no keyboard sends: copy what the mouse selected.
-        if k.code == KeyCode::F(15) {
-            return self.copy_picked();
+        // Keys no keyboard sends, used by chud.app: F15 is ⌘C (copy what the mouse selected);
+        // F13 / F14 mean the system just switched to light / dark.
+        match k.code {
+            KeyCode::F(15) => return self.copy_picked(),
+            KeyCode::F(13 | 14) if self.theme_follows => return theme::set_light(k.code == KeyCode::F(13)),
+            KeyCode::F(13 | 14) => return,
+            _ => {}
         }
         if self.help || self.menu.is_some() {
             (self.help, self.menu) = (false, None);

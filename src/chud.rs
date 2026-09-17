@@ -171,7 +171,7 @@ pub fn lines_safe(px: &Pixels) -> Vec<Line<'static>> {
 /// A progress bar whose fill runs green → amber → red across its own length, so how full it is
 /// reads from the colour as well as the length. One span per cell; the empty part is one more.
 pub fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
-    const TRACK: Color = Color::Rgb(0x33, 0x33, 0x3a);
+    let track = crate::theme::p().track;
     const STOPS: [(u8, u8, u8); 3] = [(0x8b, 0xd4, 0x7a), (0xf5, 0xc1, 0x5a), (0xf2, 0x6d, 0x6d)];
     let r = ratio.clamp(0.0, 1.0);
     let eighths = (r * width as f64 * 8.0).round() as usize;
@@ -189,20 +189,20 @@ pub fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> =
             (0..filled.min(width)).map(|i| Span::styled(" ", Style::new().bg(colour(i)))).collect();
         if width > spans.len() {
-            spans.push(Span::styled(" ".repeat(width - spans.len()), Style::new().bg(TRACK)));
+            spans.push(Span::styled(" ".repeat(width - spans.len()), Style::new().bg(track)));
         }
         return spans;
     }
     let mut spans: Vec<Span<'static>> = (0..full.min(width))
-        .map(|i| Span::styled("█", Style::new().fg(colour(i)).bg(TRACK)))
+        .map(|i| Span::styled("█", Style::new().fg(colour(i)).bg(track)))
         .collect();
     if part > 0 && full < width {
         let tip = [' ', '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}'][part];
-        spans.push(Span::styled(tip.to_string(), Style::new().fg(colour(full)).bg(TRACK)));
+        spans.push(Span::styled(tip.to_string(), Style::new().fg(colour(full)).bg(track)));
     }
     let empty = width - spans.len();
     if empty > 0 {
-        spans.push(Span::styled(" ".repeat(empty), Style::new().bg(TRACK)));
+        spans.push(Span::styled(" ".repeat(empty), Style::new().bg(track)));
     }
     spans
 }

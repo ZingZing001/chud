@@ -7,7 +7,7 @@ use iced::{alignment, event, mouse, window, Element, Event, Font, Pixels, Point,
 use iced_term::actions::Action;
 use iced_term::bindings::{Binding, BindingAction, InputKind};
 use iced_term::settings::{BackendSettings, FontSettings, Settings};
-use iced_term::{BackendCommand, Command, TermMode, TerminalView};
+use iced_term::{BackendCommand, ColorPalette, Command, TermMode, TerminalView};
 use std::collections::HashMap;
 
 fn main() -> iced::Result {
@@ -29,6 +29,43 @@ fn main() -> iced::Result {
 }
 
 const FONT_SIZE: f32 = 13.0;
+
+/// The terminal's colours on a light desktop. Not the dark palette inverted: every ANSI colour
+/// is re-picked to read on near-white, since programs print yellow and white text expecting a
+/// dark background.
+fn light_palette() -> ColorPalette {
+    let c = String::from;
+    ColorPalette {
+        foreground: c("#383a42"),
+        background: c("#fafafa"),
+        black: c("#383a42"),
+        red: c("#d7443a"),
+        green: c("#3f8f3e"),
+        yellow: c("#a86b00"),
+        blue: c("#3769d4"),
+        magenta: c("#9b2a99"),
+        cyan: c("#0a7fa6"),
+        white: c("#8e9098"),
+        bright_black: c("#6a6d78"),
+        bright_red: c("#e0564b"),
+        bright_green: c("#4ea64d"),
+        bright_yellow: c("#c28000"),
+        bright_blue: c("#4d80ea"),
+        bright_magenta: c("#b23cb0"),
+        bright_cyan: c("#1994bd"),
+        bright_white: c("#5c5f68"),
+        bright_foreground: None,
+        dim_foreground: c("#6f727c"),
+        dim_black: c("#5a5d66"),
+        dim_red: c("#a3342c"),
+        dim_green: c("#316e30"),
+        dim_yellow: c("#7f5100"),
+        dim_blue: c("#2a51a4"),
+        dim_magenta: c("#762074"),
+        dim_cyan: c("#08617f"),
+        dim_white: c("#a9abb2"),
+    }
+}
 
 fn font(size: f32) -> FontSettings {
     // line height = Fira Code's full-block height (2400/1950 em), so ▀▄█ tile with no gaps
@@ -69,6 +106,8 @@ enum Message {
     FontSize(f32),
     /// a ⌘ shortcut, as the keys chud would have seen
     Send(Vec<u8>),
+    /// the system's light or dark appearance, at start-up and whenever it changes
+    SystemTheme(iced::theme::Mode),
 }
 
 struct App {
@@ -131,8 +170,9 @@ impl App {
             Err(_) => Task::none(),
         };
         let focus = TerminalView::focus(term.widget_id().clone());
+        let system_theme = iced::system::theme().map(Message::SystemTheme);
         let app = Self { term, cursor: Point::ORIGIN, scroll_px: 0.0, font_size: FONT_SIZE, size: Size::ZERO };
-        (app, Task::batch([focus, symbols]))
+        (app, Task::batch([focus, symbols, system_theme]))
     }
 
     /// Re-measure at the current font size and re-flow the terminal to the window.
@@ -173,6 +213,14 @@ impl App {
             }
             Message::Send(bytes) => {
                 self.term.handle(write(bytes));
+            }
+            // repaint the terminal in the matching palette, and tell chud (F13 light, F14 dark)
+            // so its own bars and badges follow; chud ignores it if you pinned a theme
+            Message::SystemTheme(mode) => {
+                let light = mode == iced::theme::Mode::Light;
+                let palette = if light { light_palette() } else { ColorPalette::default() };
+                self.term.handle(Command::ChangeTheme(Box::new(palette)));
+                self.term.handle(write(if light { b"\x1b[25~".to_vec() } else { b"\x1b[26~".to_vec() }));
             }
             // iced_term only re-measures when an input event reaches it, so a window that settles
             // its size after start-up would keep a tiny terminal until you touched it. Push the
@@ -248,6 +296,10 @@ impl App {
             Event::Window(window::Event::Unfocused) => Some(Message::Focus(false)),
             _ => None,
         });
-        Subscription::batch([self.term.subscription().map(Message::Terminal), window_events])
+        Subscription::batch([
+            self.term.subscription().map(Message::Terminal),
+            window_events,
+            iced::system::theme_changes().map(Message::SystemTheme),
+        ])
     }
 }
