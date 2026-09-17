@@ -323,6 +323,12 @@ fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
         let s = &app.sessions[i];
         let [head, term] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(rect);
         session_header(f, s, &app.plan, head, split && i == app.sel);
+        if split {
+            // one click to take this session off screen; it keeps running in the sidebar
+            let close = Rect::new(head.right().saturating_sub(3), head.y, 3.min(head.width), 1);
+            f.render_widget(Line::from(" ✕ ").fg(pal().dim).bg(pal().bar_bg), close);
+            hits.push((close, Hit::ClosePane(i)));
+        }
         let p = s.parser.lock().unwrap();
         let screen = p.screen();
         // the cursor shows only where your typing goes
@@ -333,6 +339,14 @@ fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
             picked(f, app, term);
         }
         hits.push((term, Hit::Pane(i)));
+    }
+    // a session being dragged in: outline where it would open
+    if let (Some((p, zone)), Some(Drag { from: Hit::Session(i), .. })) = (app.drop, app.drag) {
+        if let Some((_, rect)) = app.sessions.get(p).and_then(|t| app.layout.rects(main).into_iter().find(|(id, _)| *id == t.id)) {
+            let name = app.sessions.get(i).map(|s| s.label()).unwrap_or_default();
+            let block = Block::bordered().border_style(Style::new().fg(pal().accent).bold()).title(format!(" open {name} here "));
+            f.render_widget(block, zone.area(rect));
+        }
     }
     let dragging = |k: usize| matches!(app.drag, Some(Drag { from: Hit::Divider(d), .. }) if d == k);
     for (k, div) in app.layout.dividers(main).into_iter().enumerate() {
@@ -761,11 +775,16 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     }
     let keys = match &app.drag {
         _ if app.select => " selecting text: drag to select · ⌘C copies · C-a v gives the mouse back to chud ",
-        Some(Drag { from: Hit::Session(_), moved: true, .. }) => " drop onto a session or a group to move it there ",
+        Some(Drag { from: Hit::Session(_), moved: true, .. }) if app.drop.is_some() => {
+            " drop near an edge to open it on that side, or in the middle to show it in that pane "
+        }
+        Some(Drag { from: Hit::Session(_), moved: true, .. }) => {
+            " drop onto a pane to open it there, or onto a session or group to move it "
+        }
         Some(Drag { from: Hit::Edge, .. }) => " drag to resize the sidebar ",
         _ if app.diff.is_some() => " diff: j/k file · J/K scroll · c commit all · r discard file · R refresh · Esc close ",
         _ if app.dash => " summary: click a card to open that session · scroll for more · Esc close ",
-        _ if app.prefix => " n new · | split · - stack · o next pane · r rename · g group · f zoom · y copy · s dashboard · d diff · x kill · ? help ",
+        _ if app.prefix => " n new · | split · - stack · o next pane · w close pane · r rename · g group · f zoom · y copy · s dashboard · d diff · x kill · ? help ",
         _ => " C-a ? help · click, drag and scroll with the mouse ",
     };
     let mut spans = vec![if app.prefix { keys.black().on_yellow() } else { keys.into() }];
@@ -802,7 +821,6 @@ fn menu(f: &mut Frame, m: &Menu, hits: &mut Hits) {
 
 const HELP: &[(&str, &str)] = &[
     ("click", "select a session · … opens its menu · a group header folds it"),
-    ("right-click", "a session or group header opens its menu"),
     ("drag", "a session onto another session or a group to move it"),
     ("drag in the terminal", "select text; letting go copies it"),
     ("drag edge", "the sidebar's right edge to resize it"),
@@ -819,8 +837,10 @@ const HELP: &[(&str, &str)] = &[
     ("⌘C / ⌘V", "copy what you selected · paste"),
     ("C-a v", "hand the mouse to the terminal, to select outside the pane"),
     ("C-a f", "zoom: hide or show the sidebar"),
-    ("C-a | / -", "split the pane side by side / stacked (drag a divider to resize)"),
+    ("C-a | / -", "show the next session beside / below (drag a divider to resize)"),
+    ("right-click", "a session: open it beside or below the current pane, or close its pane"),
     ("C-a o", "move to the next pane"),
+    ("C-a w", "close this pane (the session keeps running)"),
     ("C-a d", "diff review (c commit, r discard, R refresh)"),
     ("C-a s", "summary dashboard"),
     ("C-a x", "kill session"),

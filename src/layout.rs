@@ -50,13 +50,19 @@ impl Node {
 
     /// Splits the pane showing `at`: it keeps the first half, `new` gets the second.
     pub fn split(&mut self, at: usize, dir: Dir, new: usize) -> bool {
+        self.split_placed(at, dir, new, false)
+    }
+
+    /// The same, with `new` in the first half (left or top) when `new_first`.
+    pub fn split_placed(&mut self, at: usize, dir: Dir, new: usize, new_first: bool) -> bool {
         match self {
             Node::Leaf(id) if *id == at => {
-                *self = Node::Split { dir, ratio: 0.5, a: Box::new(Node::Leaf(at)), b: Box::new(Node::Leaf(new)) };
+                let (a, b) = if new_first { (new, at) } else { (at, new) };
+                *self = Node::Split { dir, ratio: 0.5, a: Box::new(Node::Leaf(a)), b: Box::new(Node::Leaf(b)) };
                 true
             }
             Node::Leaf(_) => false,
-            Node::Split { a, b, .. } => a.split(at, dir, new) || b.split(at, dir, new),
+            Node::Split { a, b, .. } => a.split_placed(at, dir, new, new_first) || b.split_placed(at, dir, new, new_first),
         }
     }
 
@@ -182,6 +188,52 @@ fn divide(area: Rect, dir: Dir, ratio: f32) -> (Rect, Rect, Rect) {
     }
 }
 
+/// Where a session dragged onto a pane lands: near an edge it opens on that side, in the middle
+/// it replaces what the pane shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Zone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Center,
+}
+
+impl Zone {
+    /// The zone under (`col`, `row`) in `pane`: the nearest edge within a quarter of the pane,
+    /// else the middle.
+    pub fn at(pane: Rect, col: u16, row: u16) -> Zone {
+        let fx = (col.saturating_sub(pane.x) as f32 + 0.5) / pane.width.max(1) as f32;
+        let fy = (row.saturating_sub(pane.y) as f32 + 0.5) / pane.height.max(1) as f32;
+        let edges = [(fx, Zone::Left), (1.0 - fx, Zone::Right), (fy, Zone::Top), (1.0 - fy, Zone::Bottom)];
+        let (near, zone) = edges.into_iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap_or((1.0, Zone::Center));
+        if near > 0.25 { Zone::Center } else { zone }
+    }
+
+    /// How the pane splits for this zone: (direction, new session goes first), or None to replace.
+    pub fn split(self) -> Option<(Dir, bool)> {
+        match self {
+            Zone::Left => Some((Dir::Across, true)),
+            Zone::Right => Some((Dir::Across, false)),
+            Zone::Top => Some((Dir::Down, true)),
+            Zone::Bottom => Some((Dir::Down, false)),
+            Zone::Center => None,
+        }
+    }
+
+    /// The part of `pane` the session would take, for outlining while you drag.
+    pub fn area(self, pane: Rect) -> Rect {
+        let (hw, hh) = (pane.width / 2, pane.height / 2);
+        match self {
+            Zone::Left => Rect { width: hw, ..pane },
+            Zone::Right => Rect { x: pane.x + hw, width: pane.width - hw, ..pane },
+            Zone::Top => Rect { height: hh, ..pane },
+            Zone::Bottom => Rect { y: pane.y + hh, height: pane.height - hh, ..pane },
+            Zone::Center => pane,
+        }
+    }
+}
+
 /// Whether a pane this size can be split that way, leaving both halves usable.
 pub fn fits(pane: Rect, dir: Dir) -> bool {
     match dir {
@@ -274,6 +326,21 @@ mod tests {
         n.set_ratio(&inner.path, 0.25);
         let heights: Vec<u16> = n.rects(area()).iter().skip(1).map(|(_, r)| r.height).collect();
         assert!(heights[0] < heights[1], "the upper pane shrank: {heights:?}");
+    }
+
+    #[test]
+    fn drop_zones() {
+        let p = Rect::new(40, 2, 100, 30);
+        assert_eq!(Zone::at(p, 138, 16), Zone::Right);
+        assert_eq!(Zone::at(p, 41, 16), Zone::Left);
+        assert_eq!(Zone::at(p, 90, 2), Zone::Top);
+        assert_eq!(Zone::at(p, 90, 31), Zone::Bottom);
+        assert_eq!(Zone::at(p, 90, 16), Zone::Center);
+        assert_eq!(Zone::Right.area(p), Rect::new(90, 2, 50, 30));
+
+        let mut n = Node::Leaf(1);
+        assert!(n.split_placed(1, Dir::Across, 2, true));
+        assert_eq!(n.leaves(), [2, 1], "dropped on the left edge: new session first");
     }
 
     #[test]

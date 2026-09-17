@@ -115,6 +115,8 @@ enum Hit {
     Pane(usize),
     /// the divider between split panes, by its position in `layout.dividers()`
     Divider(usize),
+    /// the ✕ on a pane's header
+    ClosePane(usize),
     Backdrop,
     SetupChoice(usize),
     SetupBack,
@@ -195,6 +197,12 @@ enum Act {
     GroupRename(usize),
     Fold(usize),
     DeleteGroup(usize),
+    /// show session i beside (or below) the focused pane
+    Split(usize, layout::Dir),
+    /// split session i's pane with a new terminal
+    SplitNew(usize, layout::Dir),
+    /// take session i off screen; it keeps running in the sidebar
+    ClosePane(usize),
 }
 
 struct Menu {
@@ -294,6 +302,8 @@ struct App {
     setup: Option<Setup>,
     /// which sessions are on screen, and how the main area is split between them
     layout: layout::Node,
+    /// where a session dragged out of the sidebar would land: (pane's session, zone)
+    drop: Option<(usize, layout::Zone)>,
     last_usage: Instant,
     plan: usage::Plan,
     tx: mpsc::Sender<Event>,
@@ -362,6 +372,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         theme_follows: true,
         setup: None,
         layout: layout::Node::Leaf(0),
+        drop: None,
         last_usage: Instant::now(),
         plan: usage::Plan::default(),
         tx,
@@ -692,6 +703,7 @@ impl App {
             KeyCode::Char('|') => self.split(layout::Dir::Across),
             KeyCode::Char('-') => self.split(layout::Dir::Down),
             KeyCode::Char('o') => self.next_pane(),
+            KeyCode::Char('w') => self.close_pane(self.sel),
             KeyCode::Char('d') => self.tool(Tool::Diff),
             KeyCode::Char('s') => self.tool(Tool::Dash),
             KeyCode::Char('?') => self.tool(Tool::Help),
@@ -919,14 +931,26 @@ impl App {
         }
     }
 
-    /// Splits the focused pane and starts a shell in the new half, as tmux does.
+    /// Splits the focused pane (C-a | and C-a -): the new half shows the next session in the
+    /// sidebar that isn't on screen yet, so splitting puts your agents side by side. Only when
+    /// every session is already showing does it start a new terminal there.
     fn split(&mut self, dir: layout::Dir) {
-        let Some(at) = self.sessions.get(self.sel).map(|s| s.id) else { return };
-        let room = self.layout.rects(self.main_area()).into_iter().find(|(id, _)| *id == at);
-        if !room.is_some_and(|(_, r)| layout::fits(r, dir)) {
-            self.flash = Some(" not enough room to split this pane · make the window bigger or zoom with C-a f ".into());
+        if self.focused_pane_fits(dir).is_none() {
             return;
         }
+        let order: Vec<usize> =
+            self.rows(true).into_iter().filter_map(|r| if let Row::Session(i) = r { Some(i) } else { None }).collect();
+        let after = order.iter().position(|&i| i == self.sel).map_or(0, |p| p + 1);
+        let hidden = (0..order.len()).map(|k| order[(after + k) % order.len()]).find(|&i| !self.layout.contains(self.sessions[i].id));
+        match hidden {
+            Some(i) => self.split_with(i, dir),
+            None => self.split_new(dir),
+        }
+    }
+
+    /// Splits the focused pane with a new terminal in the new half, as tmux does.
+    fn split_new(&mut self, dir: layout::Dir) {
+        let Some(at) = self.focused_pane_fits(dir) else { return };
         let (cwd, group) = (self.sessions[self.sel].cwd.clone(), self.sessions[self.sel].group);
         if let Some(i) = self.spawn(vec![DEFAULT_CMD.into()], cwd, group) {
             self.layout.split(at, dir, self.sessions[i].id);
@@ -934,6 +958,52 @@ impl App {
             self.apply_layout();
             self.save();
         }
+    }
+
+    /// The focused pane's session id, when that pane has room to split this way; otherwise
+    /// says why not.
+    fn focused_pane_fits(&mut self, dir: layout::Dir) -> Option<usize> {
+        let at = self.sessions.get(self.sel).map(|s| s.id)?;
+        let room = self.layout.rects(self.main_area()).into_iter().find(|(id, _)| *id == at);
+        if room.is_some_and(|(_, r)| layout::fits(r, dir)) {
+            return Some(at);
+        }
+        self.flash = Some(" not enough room to split this pane · make the window bigger or zoom with C-a f ".into());
+        None
+    }
+
+    /// Shows session i beside (or below) the pane you are working in: how you get two agents
+    /// next to each other. A session already on screen just gets the focus.
+    fn split_with(&mut self, i: usize, dir: layout::Dir) {
+        let Some(id) = self.sessions.get(i).map(|s| s.id) else { return };
+        if self.layout.contains(id) {
+            return self.select(i);
+        }
+        let focused = self.sessions.get(self.sel).map(|s| s.id).filter(|f| self.layout.contains(*f));
+        let Some(at) = focused.or(self.layout.leaves().first().copied()) else { return };
+        let room = self.layout.rects(self.main_area()).into_iter().find(|(p, _)| *p == at);
+        if !room.is_some_and(|(_, r)| layout::fits(r, dir)) {
+            self.flash = Some(" not enough room beside this pane · make the window bigger or zoom with C-a f ".into());
+            return;
+        }
+        self.layout.split(at, dir, id);
+        self.select(i);
+        self.apply_layout();
+        self.save();
+    }
+
+    /// Takes a session off screen without stopping it; its neighbour takes the space.
+    fn close_pane(&mut self, i: usize) {
+        let Some(id) = self.sessions.get(i).map(|s| s.id) else { return };
+        if self.layout.leaves().len() < 2 || !self.layout.remove(id) {
+            return;
+        }
+        if self.sel == i {
+            let first = self.layout.leaves()[0];
+            self.sel = self.sessions.iter().position(|s| s.id == first).unwrap_or(0);
+        }
+        self.apply_layout();
+        self.save();
     }
 
     fn next_pane(&mut self) {
@@ -1230,6 +1300,12 @@ impl App {
                 self.select(i);
                 self.prompt = ask(Ask::Kill, String::new());
             }
+            Act::Split(i, dir) => self.split_with(i, dir),
+            Act::SplitNew(i, dir) => {
+                self.select(i);
+                self.split_new(dir);
+            }
+            Act::ClosePane(i) => self.close_pane(i),
             Act::GroupRename(gi) => {
                 if let Some(g) = self.groups.get(gi) {
                     self.prompt = ask(Ask::GroupRename(gi), g.name.clone());
@@ -1409,13 +1485,23 @@ impl App {
             }
             Some(Hit::SessionMenu(i)) => {
                 let gi = self.groups.iter().position(|g| g.id == self.sessions[i].group).unwrap_or(0);
-                self.menu = at(vec![
-                    ("Rename…", Act::Rename(i)),
-                    ("Move to group…", Act::Group(i)),
+                let mut items = vec![("Rename…", Act::Rename(i)), ("Move to group…", Act::Group(i))];
+                if self.layout.contains(self.sessions[i].id) {
+                    items.push(("New terminal beside", Act::SplitNew(i, layout::Dir::Across)));
+                    items.push(("New terminal below", Act::SplitNew(i, layout::Dir::Down)));
+                    if self.layout.leaves().len() > 1 {
+                        items.push(("Close pane (keeps running)", Act::ClosePane(i)));
+                    }
+                } else {
+                    items.push(("Open beside current pane", Act::Split(i, layout::Dir::Across)));
+                    items.push(("Open below current pane", Act::Split(i, layout::Dir::Down)));
+                }
+                items.extend([
                     ("New terminal here", Act::NewTerminal(gi)),
                     ("Review changes", Act::Diff(i)),
                     ("Kill…", Act::Kill(i)),
-                ])
+                ]);
+                self.menu = at(items)
             }
             Some(Hit::Group(gi)) => {
                 self.groups[gi].collapsed ^= true;
@@ -1451,6 +1537,7 @@ impl App {
                 self.drag = Some(Drag { from: Hit::Pane(i), at: (m.column, m.row), moved: false });
                 self.to_pane(m, i);
             }
+            Some(Hit::ClosePane(i)) => self.close_pane(i),
             Some(h @ Hit::Divider(_)) => self.drag = Some(Drag { from: h, at: (m.column, m.row), moved: false }),
             _ => {}
         }
@@ -1475,15 +1562,61 @@ impl App {
                     self.layout.set_ratio(&path, ratio);
                 }
             }
+            Hit::Session(_) => {
+                self.hover = hit;
+                // out of the sidebar and over a pane: outline where it would open
+                self.drop = self.pane_at(m.column, m.row).map(|(p, r)| (p, layout::Zone::at(r, m.column, m.row)));
+            }
             _ => self.hover = hit,
         }
+    }
+
+    /// The pane under a point, header included: its session index and area.
+    fn pane_at(&self, col: u16, row: u16) -> Option<(usize, Rect)> {
+        let at = ratatui::layout::Position::new(col, row);
+        let (id, r) = self.layout.rects(self.main_area()).into_iter().find(|(_, r)| r.contains(at))?;
+        Some((self.sessions.iter().position(|s| s.id == id)?, r))
+    }
+
+    /// A session dragged onto a pane: near an edge it opens on that side, in the middle it takes
+    /// the pane's place. One already on screen moves rather than appearing twice.
+    fn drop_on_pane(&mut self, i: usize, p: usize, zone: layout::Zone) {
+        let (Some(id), Some(target)) = (self.sessions.get(i).map(|s| s.id), self.sessions.get(p).map(|s| s.id)) else {
+            return;
+        };
+        if id == target {
+            return;
+        }
+        match zone.split() {
+            None => {
+                self.layout.remove(id);
+                self.layout.replace(target, id);
+            }
+            Some((dir, first)) => {
+                let room = self.layout.rects(self.main_area()).into_iter().find(|(t, _)| *t == target);
+                if !room.is_some_and(|(_, r)| layout::fits(r, dir)) {
+                    self.flash = Some(" not enough room to open it there · make the window bigger or zoom with C-a f ".into());
+                    return;
+                }
+                self.layout.remove(id);
+                self.layout.split_placed(target, dir, id, first);
+            }
+        }
+        self.select(i);
+        self.apply_layout();
+        self.save();
     }
 
     fn release(&mut self, hit: Option<Hit>, m: MouseEvent) {
         let Some(d) = self.drag.take() else { return };
         self.hover = None;
+        let dropped = self.drop.take();
         match d.from {
             Hit::Session(i) if !d.moved || hit == Some(Hit::Session(i)) => self.select(i), // a click
+            Hit::Session(i) if dropped.is_some() => {
+                let (p, zone) = dropped.unwrap();
+                self.drop_on_pane(i, p, zone);
+            }
             Hit::Session(i) => self.drop_session(i, hit),
             Hit::Edge => {
                 self.apply_layout();

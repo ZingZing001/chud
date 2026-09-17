@@ -14,7 +14,7 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 |---|---|
 | **Live agent status** | Working, needs input, done, or exited, for Claude Code and Copilot CLI. It also picks up agents you start by hand inside a shell session. |
 | **Notifications & unread markers** | A macOS notification when an agent finishes or asks for input; a marker on sessions you haven't looked at since. |
-| **Split panes** | Watch several agents at once: split any pane side by side or stacked, drag dividers to resize. The layout survives a restart. |
+| **Split panes** | Watch several agents at once: drag a session out of the sidebar onto a pane to open it beside, above or below. Drag dividers to resize; the layout survives a restart. |
 | **Any agent** | Codex, Gemini CLI, aider, opencode and amp out of the box; add your own harness in `config.json`. |
 | **Light and dark** | Follows the system theme, live in chud.app. |
 | **Plan usage header** | Claude's rolling 5-hour limit with a reset countdown plus the weekly %, or Copilot's monthly premium requests. |
@@ -93,7 +93,7 @@ chud claude copilot     # open these sessions instead
 chud "claude --model opus" zsh
 ```
 
-Split with `C-a |` or `C-a -` (⌘D in chud.app), click a pane to type into it, and drag the line between panes to resize. Picking a session in the sidebar shows it in the focused pane.
+To watch sessions side by side, drag one out of the sidebar onto a pane: near an edge it opens on that side, in the middle it takes that pane's place. Right-click a session for **Open beside / below current pane**, or press `C-a |` / `C-a -` (⌘D in chud.app) to show the next session beside the one you're in. Click a pane to type into it, drag the line between panes to resize, and close a pane with its **✕** or `C-a w` — the session keeps running in the sidebar.
 
 Drag across the terminal to select text. Letting go copies it, ⌘C copies it again, and ⌘V pastes.
 
@@ -113,8 +113,9 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a y` | Copy what this session shows to the clipboard |
 | `C-a v` | Hand the mouse to the terminal, to select outside the pane |
 | `C-a f` | Zoom: hide or show the sidebar |
-| `C-a \|` / `C-a -` | Split the focused pane side by side / stacked |
+| `C-a \|` / `C-a -` | Show the next session beside / below this one |
 | `C-a o` | Move to the next pane |
+| `C-a w` | Close this pane (the session keeps running) |
 | `C-a d` | Diff review (`c` commit, `r` discard, `R` refresh) |
 | `C-a s` | Dashboard |
 | `C-a x` | Kill session |
