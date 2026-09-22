@@ -214,6 +214,9 @@ pub struct Session {
     /// the process in front (the agent, when one runs), and the Copilot session found for it
     fg_pid: Option<i32>,
     found: Option<String>,
+    /// the agent in front and the chat it has on disk (id, folder), so a restart can resume it
+    /// even when it was typed into a shell rather than started by chud
+    pub resume: Option<(Agent, String, PathBuf)>,
     /// the agent a script or interpreter in front is running, read from its command line
     fg_script: Option<Agent>,
     activity: Activity,
@@ -321,6 +324,7 @@ impl Session {
             probed: Instant::now(),
             fg_pid: None,
             found: None,
+            resume: None,
             fg_script: None,
             activity: Activity::default(),
             writer,
@@ -484,6 +488,7 @@ impl Session {
             return false;
         }
         self.agent = agent;
+        self.resume = None; // that agent is gone; the next one is found by refresh_usage
         let mut p = self.parser.lock().unwrap();
         let s = p.callbacks_mut();
         s.chat.clear(); // a different program: the old chat name and summary no longer apply
@@ -519,6 +524,9 @@ impl Session {
             .unwrap_or_else(|| self.cwd.clone());
         if let Some(path) = usage::log_path(copilot, &sid, &cwd) {
             self.usage.refresh(&path, copilot);
+            if path.exists() {
+                self.resume = Some((self.agent.clone(), sid.clone(), cwd.clone()));
+            }
         }
         // Claude Code itself reports what its context holds and how big the window is, which
         // beats adding up the transcript against a guessed window (see usage::claude_context).
@@ -548,10 +556,13 @@ fn find_sid(home: &Path, agent: &Agent, pid: i32) -> Option<(String, Option<Path
             let v: serde_json::Value = serde_json::from_str(&text).ok()?;
             Some((v["sessionId"].as_str()?.to_string(), v["cwd"].as_str().map(PathBuf::from)))
         }
+        // A copilot that switched chats with /resume still holds the lock on the empty one it
+        // started with, so of the chats it has locked, the one it wrote to last is the live one.
         Agent::Copilot => std::fs::read_dir(home.join(".copilot/session-state"))
             .ok()?
             .flatten()
-            .find(|e| e.path().join(format!("inuse.{pid}.lock")).exists())
+            .filter(|e| e.path().join(format!("inuse.{pid}.lock")).exists())
+            .max_by_key(|e| e.path().join("events.jsonl").metadata().and_then(|m| m.modified()).ok())
             .map(|e| (e.file_name().to_string_lossy().into_owned(), None)),
         _ => None,
     }
@@ -659,6 +670,24 @@ mod tests {
         let perm = osc(&format!(r#"{{"v":1,"event":"permission_request","summary":"x{semis}y"}}"#));
         let s = feed(format!("{working}{perm}").as_bytes());
         assert_eq!(s.status, Status::NeedsInput, "truncated payload still yields the event");
+    }
+
+    /// Two chats locked by one copilot, as /resume leaves them: the empty one it started with,
+    /// and the one it switched to and keeps writing.
+    #[test]
+    fn copilot_is_in_the_chat_it_writes_to() {
+        let home = std::env::temp_dir().join(format!("chud-copilot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for (sid, events) in [("empty-start", "{}\n"), ("live-chat", "{}\n{}\n{}\n")] {
+            let dir = home.join(".copilot/session-state").join(sid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("inuse.4242.lock"), "").unwrap();
+            std::fs::write(dir.join("events.jsonl"), events).unwrap();
+            std::thread::sleep(Duration::from_millis(20)); // the live chat is written last
+        }
+        assert_eq!(find_sid(&home, &Agent::Copilot, 4242).map(|(s, _)| s).as_deref(), Some("live-chat"));
+        assert_eq!(find_sid(&home, &Agent::Copilot, 999), None, "no lock, no chat");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

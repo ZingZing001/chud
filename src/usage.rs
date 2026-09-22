@@ -44,6 +44,19 @@ pub fn log_path(copilot: bool, sid: &str, cwd: &Path) -> Option<PathBuf> {
     })
 }
 
+/// The folder a Claude chat ran in, found from its id alone: the transcript sits under a
+/// per-folder directory, and its lines record the folder. For state saved before chud kept
+/// the folder itself.
+pub fn claude_chat_cwd(home: &Path, sid: &str) -> Option<PathBuf> {
+    let name = format!("{sid}.jsonl");
+    let file = std::fs::read_dir(home.join(".claude/projects")).ok()?.flatten().map(|d| d.path().join(&name)).find(|p| p.exists())?;
+    // the first lines are enough; transcripts run to tens of megabytes
+    BufReader::new(File::open(file).ok()?).lines().take(50).map_while(Result::ok).find_map(|l| {
+        let v: Value = serde_json::from_str(&l).ok()?;
+        v["cwd"].as_str().map(PathBuf::from)
+    })
+}
+
 /// The same minute, in the clock on the wall here. Asked of the C library once: it knows the
 /// zone and whether daylight saving was on.
 pub fn local_minute(minute: u64) -> u64 {

@@ -20,7 +20,7 @@ use ratatui::layout::Rect;
 use serde_json::{json, Value};
 use session::{Agent, Event, Session, Status};
 use std::io::{stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -297,6 +297,16 @@ fn resume_argv(argv: &[String], sid: &str, saved: bool) -> Vec<String> {
     } else {
         argv.to_vec()
     }
+}
+
+/// `zsh -ic "claude --resume <id>; exec zsh"`: the shell runs the agent's chat and becomes a
+/// plain shell again once you quit it. None unless `argv` is a shell and the id is only letters,
+/// digits and dashes, since it lands in a command line.
+fn resume_in_shell(argv: &[String], agent: &str, sid: &str) -> Option<Vec<String>> {
+    let shell = argv.first().filter(|p| session::agent_of(p) == Agent::Shell && !cfg!(windows))?;
+    let safe = !sid.is_empty() && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let agent = ["claude", "copilot"].into_iter().find(|a| *a == agent)?;
+    safe.then(|| vec![shell.clone(), "-ic".into(), format!("{agent} --resume {sid}; exec {shell}")])
 }
 
 fn state_path() -> PathBuf {
@@ -1255,8 +1265,12 @@ impl App {
             .sessions
             .iter()
             .map(|s| {
+                // an agent typed into a shell: the chat it has open, so a restart reopens it
+                let resume = s.resume.as_ref().filter(|(agent, ..)| *agent == s.agent).map(|(agent, sid, cwd)| {
+                    json!({ "agent": if *agent == Agent::Copilot { "copilot" } else { "claude" }, "sid": sid, "cwd": cwd })
+                });
                 json!({ "argv": s.argv, "cwd": s.cwd, "name": s.name, "group": s.group,
-                        "sid": s.agent_sid(), "worked": s.worked().as_secs() })
+                        "sid": s.agent_sid(), "worked": s.worked().as_secs(), "resume": resume })
             })
             .collect();
         let path = state_path();
@@ -1294,7 +1308,24 @@ impl App {
             let sid = s["sid"].as_str().unwrap_or_default();
             let copilot = session::agent_of(prog) == Agent::Copilot;
             let saved = usage::log_path(copilot, sid, &cwd).is_some_and(|p| p.exists());
-            let run = resume_argv(&argv, sid, saved);
+            let mut run = resume_argv(&argv, sid, saved);
+            let mut cwd = cwd;
+            // a terminal you ran claude or copilot in comes back running that chat again, in
+            // the folder it was in, and leaves you at the prompt when you quit it
+            // (state from before chud saved "resume" has only the chat id a warp-reporting claude
+            // gave; its folder is read back from the transcript)
+            let old = match s.get("resume") {
+                None if !sid.is_empty() => usage::claude_chat_cwd(&config::home(), sid)
+                    .map(|dir| json!({ "agent": "claude", "sid": sid, "cwd": dir })),
+                _ => None,
+            };
+            let r = old.as_ref().unwrap_or(&s["resume"]);
+            if let (Some(agent), Some(rsid), Some(rcwd)) = (r["agent"].as_str(), r["sid"].as_str(), r["cwd"].as_str()) {
+                let on_disk = usage::log_path(agent == "copilot", rsid, Path::new(rcwd)).is_some_and(|p| p.exists());
+                if let Some(argv) = resume_in_shell(&argv, agent, rsid).filter(|_| on_disk) {
+                    (run, cwd) = (argv, PathBuf::from(rcwd));
+                }
+            }
             let group = s["group"].as_u64().unwrap_or(0) as usize;
             let group = if self.groups.iter().any(|g| g.id == group) { group } else { 0 };
             if let Some(i) = self.spawn(run, cwd, group) {
@@ -1959,6 +1990,21 @@ mod tests {
 
     fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
+    }
+
+    #[test]
+    fn a_shell_comes_back_running_its_chat() {
+        let zsh = vec!["zsh".to_string()];
+        let id = "b8d81aaf-7db2-43f9-9cae-3d2211082fb9";
+        assert_eq!(
+            resume_in_shell(&zsh, "claude", id),
+            Some(vec!["zsh".into(), "-ic".into(), format!("claude --resume {id}; exec zsh")])
+        );
+        assert!(resume_in_shell(&zsh, "copilot", id).is_some());
+        assert_eq!(resume_in_shell(&["claude".to_string()], "claude", id), None, "agents resume their own way");
+        assert_eq!(resume_in_shell(&zsh, "claude", "x; rm -rf ~"), None, "the id lands in a command line");
+        assert_eq!(resume_in_shell(&zsh, "claude", ""), None);
+        assert_eq!(resume_in_shell(&zsh, "sh -c evil", id), None, "only the two agents we know");
     }
 
     #[test]

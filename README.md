@@ -24,7 +24,7 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 | **Diff review** | See the repo's changed files, then commit or discard without leaving chud. |
 | **Copy and paste** | Drag over the terminal to select and copy; ⌘V pastes. `C-a y` copies the whole session view. |
 | **Mouse-first UI** | Toolbar, `…` and right-click menus, drag and drop, resizable sidebar. Every action also has a keyboard shortcut. |
-| **Restore on restart** | Layout, groups, names and agent chats come back the next time you run `chud`. |
+| **Restore on restart** | Layout, groups, names and agent chats come back the next time you run `chud` — including a Claude or Copilot chat you started by hand in a terminal, which reopens in the folder it ran in. |
 | **Fast & idle-friendly** | Draws only when something changes; release builds use fat LTO. |
 
 ## Installation
