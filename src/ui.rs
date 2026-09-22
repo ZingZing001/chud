@@ -350,13 +350,34 @@ fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
     }
     let dragging = |k: usize| matches!(app.drag, Some(Drag { from: Hit::Divider(d), .. }) if d == k);
     for (k, div) in app.layout.dividers(main).into_iter().enumerate() {
-        let colour = if dragging(k) { pal().accent } else { pal().dim };
+        let held = dragging(k);
+        let colour = if held { pal().accent } else { pal().dim };
+        let vertical = div.dir == crate::layout::Dir::Across;
         let lines: Vec<Line> = match div.dir {
             crate::layout::Dir::Across => (0..div.rect.height).map(|_| Line::from("│")).collect(),
             crate::layout::Dir::Down => vec![Line::from("─".repeat(div.rect.width as usize))],
         };
         f.render_widget(Paragraph::new(lines).fg(colour), div.rect);
+        grip(f, div.rect, vertical, held);
         hits.push((div.rect, Hit::Divider(k)));
+    }
+}
+
+/// The handle in the middle of a divider. A plain rule looks like decoration, so every edge you
+/// can drag wears a short heavy segment — the same block as the line itself, so a font that
+/// draws one draws the other — and lights up in the accent while you hold it.
+fn grip(f: &mut Frame, rect: Rect, vertical: bool, held: bool) {
+    const LEN: u16 = 3;
+    let colour = if held { pal().accent } else { pal().bar_fg };
+    if vertical {
+        let n = LEN.min(rect.height);
+        let at = Rect::new(rect.x, rect.y + (rect.height - n) / 2, 1, n);
+        let lines: Vec<Line> = (0..n).map(|_| Line::from("┃")).collect();
+        f.render_widget(Paragraph::new(lines).fg(colour), at);
+    } else {
+        let n = LEN.min(rect.width);
+        let at = Rect::new(rect.x + (rect.width - n) / 2, rect.y, n, 1);
+        f.render_widget(Span::from("━".repeat(n as usize)).fg(colour), at);
     }
 }
 
@@ -461,11 +482,17 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         .collect();
     let mut state = ListState::default().with_selected(selected);
     let border = Block::new().borders(Borders::RIGHT).border_style(Style::new().fg(if edge { pal().accent } else { pal().dim }));
+    // a search that matches nothing would otherwise leave the sidebar blank, looking broken
+    let items = match items.is_empty() && app.finding().is_some_and(|q| !q.is_empty()) {
+        true => vec![ListItem::new(Line::from(" no session matches").fg(pal().dim))],
+        false => items,
+    };
     let list = List::new(items).block(border);
     f.render_stateful_widget(list, area, &mut state);
 
     // click regions follow the list's scroll offset
     let right = area.right().saturating_sub(1);
+    grip(f, Rect::new(right, area.y, 1, area.height), true, edge);
     let mut y = area.y;
     for &row in rows.iter().skip(state.offset()) {
         if y >= area.bottom() {
@@ -784,7 +811,7 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         Some(Drag { from: Hit::Edge, .. }) => " drag to resize the sidebar ",
         _ if app.diff.is_some() => " diff: j/k file · J/K scroll · c commit all · r discard file · R refresh · Esc close ",
         _ if app.dash => " summary: click a card to open that session · scroll for more · Esc close ",
-        _ if app.prefix => " n new · | split · - stack · o next pane · w close pane · r rename · g group · f zoom · y copy · s dashboard · d diff · x kill · ? help ",
+        _ if app.prefix => " n new · / find · | split · - stack · o next pane · w close pane · r rename · g group · f zoom · y copy · s dashboard · d diff · x kill · ? help ",
         _ => " C-a ? help · click, drag and scroll with the mouse ",
     };
     let mut spans = vec![if app.prefix { keys.black().on_yellow() } else { keys.into() }];
@@ -828,6 +855,7 @@ const HELP: &[(&str, &str)] = &[
     ("C-a n", "new terminal (zsh) in this group"),
     ("C-a j / k / 1-9", "next / previous / nth session"),
     ("C-a Tab", "jump to the next session that needs you"),
+    ("C-a /", "find a session by name, folder or agent"),
     ("C-a r", "rename session (empty = automatic name)"),
     ("C-a g", "move session to a group (new name creates it)"),
     ("C-a G", "rename this session's group"),
@@ -867,23 +895,27 @@ fn prompt(f: &mut Frame, p: &Prompt, hits: &mut Hits) {
         Ask::Group => " move to group: name (new name creates it, empty = ungrouped) ",
         Ask::GroupRename(_) => " rename group ",
         Ask::NewGroup => " new group: name ",
+        Ask::Find => " find a session: type any part of its name ",
         Ask::Kill => " kill this session? ",
         Ask::Discard => " discard all changes to this file? ",
         Ask::Quit => " sessions still running, quit and kill them? ",
     };
-    let yes_no = matches!(p.ask, Ask::Kill | Ask::Discard | Ask::Quit);
-    let text = if yes_no { String::new() } else { format!("{}▏", p.input) };
+    let yes_no = p.yes_no();
+    let text = if yes_no { " ← → to choose · enter to confirm".to_string() } else { format!("{}▏", p.input) };
     let a = f.area();
     let w = 72.min(a.width);
     let r = Rect::new((a.width - w) / 2, a.height / 3, w, 3.min(a.height));
     f.render_widget(Clear, r);
-    f.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), r);
+    f.render_widget(Paragraph::new(text.dim()).block(Block::bordered().title(title)), r);
     let (ok, cancel) = if yes_no { (" Yes ", " No ") } else { (" OK ", " Cancel ") };
     let y = r.bottom().saturating_sub(1);
     let cancel_r = Rect::new(r.right().saturating_sub(cancel.len() as u16 + 2), y, cancel.len() as u16, 1);
     let ok_r = Rect::new(cancel_r.x.saturating_sub(ok.len() as u16 + 1), y, ok.len() as u16, 1);
-    f.render_widget(ok.fg(pal().on_accent).bg(pal().accent), ok_r);
-    f.render_widget(cancel.fg(pal().bar_fg).bg(pal().button_bg), cancel_r);
+    // one of the two is lit: on a yes/no prompt that is the one Enter takes
+    let (lit, dull) = (|s: &'static str| s.fg(pal().on_accent).bg(pal().accent), |s: &'static str| s.fg(pal().bar_fg).bg(pal().button_bg));
+    let chose_no = yes_no && !p.yes;
+    f.render_widget(if chose_no { dull(ok) } else { lit(ok) }, ok_r);
+    f.render_widget(if chose_no { lit(cancel) } else { dull(cancel) }, cancel_r);
     hits.push((ok_r, Hit::Ok));
     hits.push((cancel_r, Hit::Cancel));
 }

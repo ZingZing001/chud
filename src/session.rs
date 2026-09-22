@@ -111,9 +111,9 @@ impl vt100::Callbacks for Signals {
                 self.progress_seen = true;
                 self.set(if *state == b"0" { Status::Done } else { Status::Working }, None)
             }
-            [b"9", ..] => self.set(Status::NeedsInput, Some(rest(1))),
+            [b"9", ..] => self.notify(Some(rest(1))),
             [b"777", b"notify", b"warp://cli-agent", ..] => self.warp(&rest(3)),
-            [b"777", b"notify", _, ..] => self.set(Status::NeedsInput, Some(rest(3))),
+            [b"777", b"notify", _, ..] => self.notify(Some(rest(3))),
             _ => {}
         }
     }
@@ -142,12 +142,26 @@ impl vt100::Callbacks for Signals {
 
 impl Signals {
     fn set(&mut self, status: Status, summary: Option<String>) {
-        // A bell/notify only means "needs you" mid-turn; after the turn it's claude's
-        // 60s "still waiting" reminder, which must not flip Done back.
+        // A *bell* only means "needs you" mid-turn: shells beep at tab completion, and after
+        // the turn it's claude's 60s "still waiting" reminder, which must not flip Done back.
         if status == Status::NeedsInput && self.status != Status::Working {
             return;
         }
         self.status = status;
+        if let Some(s) = summary {
+            self.summary = s;
+        }
+    }
+
+    /// The program asked the terminal to notify you (OSC 9, OSC 777). Unlike a bell that is
+    /// an unambiguous "this one needs you", so it counts even when chud never saw the turn
+    /// start — without the claude-code-warp plugin, a permission request is the *first* thing
+    /// chud hears about the session, and gating it on Working kept the count stuck at 0.
+    fn notify(&mut self, summary: Option<String>) {
+        if self.status == Status::Done {
+            return; // the turn is over: claude's "still waiting" reminder
+        }
+        self.status = Status::NeedsInput;
         if let Some(s) = summary {
             self.summary = s;
         }
@@ -172,7 +186,11 @@ impl Signals {
             Some("stop" | "stop_failure") => Status::Done,
             _ => return,
         };
-        self.set(status, field("summary").or(field("response")).or(field("query")));
+        let summary = field("summary").or(field("response")).or(field("query"));
+        match status {
+            Status::NeedsInput => self.notify(summary),
+            _ => self.set(status, summary),
+        }
     }
 }
 
@@ -612,6 +630,16 @@ mod tests {
         assert_eq!((s.status, s.summary.as_str()), (Status::NeedsInput, "Needs your permission"));
         let s = feed(b"\x1b]9;4;3;0\x07\x1b]9;4;0;0\x07\x1b]9;still waiting\x07\x07");
         assert_eq!(s.status, Status::Done, "reminders after the turn don't flip Done");
+    }
+
+    /// What a claude session emits for a permission request with no warp plugin installed:
+    /// one OSC 9 and one bell, with nothing before them to say the turn had started.
+    #[test]
+    fn a_permission_request_counts_without_the_plugin() {
+        let s = feed("\x1b]9;Claude needs your permission to use Bash\x07\x07".as_bytes());
+        assert_eq!(s.status, Status::NeedsInput, "an unprompted notification still needs you");
+        assert_eq!(s.summary, "Claude needs your permission to use Bash");
+        assert_eq!(feed(b"\x07").status, Status::Idle, "but a bare beep (zsh completion) does not");
     }
 
     #[test]

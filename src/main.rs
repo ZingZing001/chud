@@ -39,11 +39,49 @@ enum Ask {
     Group,
     GroupRename(usize), // index into App.groups
     NewGroup,
+    /// filters the sidebar as you type, rather than answering on Enter
+    Find,
+}
+
+/// Fuzzy match: every character of the query, in order, anywhere in the text, case-insensitive.
+/// The score favours runs of adjacent characters and matches at the start of a word, so "cl"
+/// ranks "claude" above "terminal", and returns None when the text doesn't match at all.
+/// Matching the first occurrence of each character is greedy but never misses a subsequence.
+fn fuzzy(query: &str, text: &str) -> Option<i32> {
+    let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let (mut qi, mut score, mut run, mut start) = (0, 0, 0, None);
+    for (i, &c) in t.iter().enumerate() {
+        if qi < q.len() && c == q[qi] {
+            run += 1;
+            let word_start = i == 0 || !t[i - 1].is_alphanumeric();
+            score += run + if word_start { 4 } else { 0 };
+            start.get_or_insert(i as i32);
+            qi += 1;
+        } else {
+            run = 0;
+        }
+    }
+    // a match near the front of the name beats the same letters found late in a longer one
+    (qi == q.len()).then(|| score - start.unwrap_or(0))
 }
 
 struct Prompt {
     ask: Ask,
     input: String,
+    /// which button a yes/no prompt has selected, moved with the arrow keys and taken by Enter
+    yes: bool,
+}
+
+impl Prompt {
+    fn new(ask: Ask, input: String) -> Prompt {
+        Prompt { ask, input, yes: true }
+    }
+
+    /// Yes/no prompts answer a question; the rest take typing.
+    fn yes_no(&self) -> bool {
+        matches!(self.ask, Ask::Kill | Ask::Discard | Ask::Quit)
+    }
 }
 
 struct Diff {
@@ -674,7 +712,7 @@ impl App {
 
     fn command(&mut self, k: KeyEvent, ctrl_a: bool) {
         let has = self.sel < self.sessions.len();
-        let ask = |ask: Ask, input: String| Some(Prompt { ask, input });
+        let ask = |ask: Ask, input: String| Some(Prompt::new(ask, input));
         match k.code {
             _ if ctrl_a => {
                 if let Some(s) = self.sessions.get(self.sel) {
@@ -704,6 +742,7 @@ impl App {
             KeyCode::Char('-') => self.split(layout::Dir::Down),
             KeyCode::Char('o') => self.next_pane(),
             KeyCode::Char('w') => self.close_pane(self.sel),
+            KeyCode::Char('/') if has => self.prompt = ask(Ask::Find, String::new()),
             KeyCode::Char('d') => self.tool(Tool::Diff),
             KeyCode::Char('s') => self.tool(Tool::Dash),
             KeyCode::Char('?') => self.tool(Tool::Help),
@@ -776,18 +815,35 @@ impl App {
 
     fn prompt_key(&mut self, k: KeyEvent) {
         let Some(mut p) = self.prompt.take() else { return };
-        let yes_no = matches!(p.ask, Ask::Kill | Ask::Discard | Ask::Quit);
+        let yes_no = p.yes_no();
         match k.code {
             KeyCode::Esc => {}
             KeyCode::Char('y') if yes_no => self.confirm(p.ask),
-            _ if yes_no => {}
-            KeyCode::Enter => self.submit(p.ask, p.input.trim()),
-            KeyCode::Backspace => {
-                p.input.pop();
+            KeyCode::Char('n') if yes_no => {}
+            // the buttons are a two-item row: arrows (or Tab) walk it, Enter takes the one lit
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab if yes_no => {
+                p.yes = !p.yes;
                 self.prompt = Some(p);
             }
-            KeyCode::Char(c) => {
-                p.input.push(c);
+            KeyCode::Enter if yes_no => {
+                if p.yes {
+                    self.confirm(p.ask)
+                }
+            }
+            _ if yes_no => self.prompt = Some(p),
+            KeyCode::Enter => self.submit(p.ask, p.input.trim()),
+            KeyCode::Backspace | KeyCode::Char(_) => {
+                match k.code {
+                    KeyCode::Char(c) => p.input.push(c),
+                    _ => {
+                        p.input.pop();
+                    }
+                }
+                // the find box filters and follows as you type; the rest answer on Enter
+                if matches!(p.ask, Ask::Find) {
+                    let q = p.input.clone();
+                    self.jump_to_match(&q);
+                }
                 self.prompt = Some(p);
             }
             _ => self.prompt = Some(p),
@@ -796,7 +852,7 @@ impl App {
 
     /// The prompt's OK / Yes button.
     fn accept_prompt(&mut self) {
-        if let Some(Prompt { ask, input }) = self.prompt.take() {
+        if let Some(Prompt { ask, input, .. }) = self.prompt.take() {
             match ask {
                 Ask::Kill | Ask::Discard | Ask::Quit => self.confirm(ask),
                 _ => self.submit(ask, input.trim()),
@@ -1025,7 +1081,37 @@ impl App {
 
     fn rows(&self, expand_all: bool) -> Vec<Row> {
         let members: Vec<usize> = self.sessions.iter().map(|s| s.group).collect();
-        layout(&self.groups, &members, expand_all)
+        let rows = layout(&self.groups, &members, expand_all);
+        // While you are searching the sidebar shows the matches, flat: groups would only hide
+        // what you are looking for. expand_all callers want every session, so they keep it.
+        match self.finding() {
+            Some(q) if !expand_all && !q.is_empty() => {
+                rows.into_iter().filter(|r| matches!(r, Row::Session(i) if self.matches(*i, q).is_some())).collect()
+            }
+            _ => rows,
+        }
+    }
+
+    /// The query typed into the find box, while it is open.
+    fn finding(&self) -> Option<&str> {
+        self.prompt.as_ref().filter(|p| matches!(p.ask, Ask::Find)).map(|p| p.input.as_str())
+    }
+
+    fn matches(&self, i: usize, query: &str) -> Option<i32> {
+        let s = &self.sessions[i];
+        // the name you see, plus the folder behind an auto name and the agent you started
+        fuzzy(query, &format!("{} {} {}", s.label(), s.folder(), s.argv.first().map_or("", |a| a.as_str())))
+    }
+
+    /// Each keystroke in the find box moves to the best match, so the pane follows the search.
+    fn jump_to_match(&mut self, query: &str) {
+        if query.is_empty() {
+            return; // an empty box matches everything: stay where you are
+        }
+        let best = (0..self.sessions.len()).filter_map(|i| Some((self.matches(i, query)?, i))).max();
+        if let Some((_, i)) = best {
+            self.select(i);
+        }
     }
 
     /// Sessions in sidebar order, skipping folded groups.
@@ -1249,8 +1335,8 @@ impl App {
     fn diff_act(&mut self, act: DiffAct) {
         let has_files = self.diff.as_ref().is_some_and(|d| !d.files.is_empty());
         match act {
-            DiffAct::Commit if has_files => self.prompt = Some(Prompt { ask: Ask::Commit, input: String::new() }),
-            DiffAct::Discard if has_files => self.prompt = Some(Prompt { ask: Ask::Discard, input: String::new() }),
+            DiffAct::Commit if has_files => self.prompt = Some(Prompt::new(Ask::Commit, String::new())),
+            DiffAct::Discard if has_files => self.prompt = Some(Prompt::new(Ask::Discard, String::new())),
             DiffAct::Refresh => self.refresh_diff(),
             DiffAct::Close => self.diff = None,
             _ => {}
@@ -1279,7 +1365,7 @@ impl App {
     }
 
     fn run_act(&mut self, act: Act) {
-        let ask = |ask: Ask, input: String| Some(Prompt { ask, input });
+        let ask = |ask: Ask, input: String| Some(Prompt::new(ask, input));
         match act {
             Act::Rename(i) => {
                 self.select(i);
@@ -1873,6 +1959,22 @@ mod tests {
 
     fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
+    }
+
+    #[test]
+    fn fuzzy_finds_and_ranks() {
+        assert!(fuzzy("", "anything").is_some(), "an empty search matches everything");
+        assert!(fuzzy("cld", "claude · chud").is_some(), "gaps are allowed");
+        assert!(fuzzy("xyz", "claude").is_none());
+        assert!(fuzzy("CHUD", "chud").is_some(), "case is ignored both ways");
+        // the whole word beats the same letters scattered, and a word start beats mid-word
+        let best = |q: &str, a: &str, b: &str| {
+            let (sa, sb) = (fuzzy(q, a).unwrap(), fuzzy(q, b).unwrap());
+            assert!(sa > sb, "{q:?}: {a:?} ({sa}) should rank above {b:?} ({sb})");
+        };
+        best("auth", "auth tokens", "a quick thing");
+        best("cl", "claude code", "terminal client");
+        best("api", "api server", "rapid");
     }
 
     #[test]

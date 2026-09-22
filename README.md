@@ -106,6 +106,7 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a n` | New terminal (zsh) in this group |
 | `C-a j` / `k` / `1`–`9` | Next / previous / nth session |
 | `C-a Tab` | Jump to the next session that needs you |
+| `C-a /` | Find a session: type any part of its name, folder or agent |
 | `C-a r` | Rename session (empty = automatic name from the chat title) |
 | `C-a g` / `G` | Move session to a group / rename its group |
 | `C-a z` | Fold / unfold this group |
