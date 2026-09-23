@@ -472,7 +472,9 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         // Block until something happens (idle = no wakeups); while something is animating or
         // timing, wake once a second. Then drain and draw once.
         let ticking = app.dash
-            || app.sessions.iter().any(|s| s.working_since.is_some() || s.status() == Status::NeedsInput);
+            || app.sessions.iter().any(|s| {
+                s.working_since.is_some() || s.status() == Status::NeedsInput || s.compacting()
+            });
         let first = if ticking { rx.recv_timeout(TICK).ok() } else { Some(rx.recv()?) };
         let mut dirty = first.is_some_and(|e| app.handle(e));
         while let Ok(e) = rx.try_recv() {
@@ -522,7 +524,8 @@ impl App {
                     }
                     self.sessions[i].on_output();
                     let status = self.check_status(i);
-                    agent || status || (i == self.sel && self.diff.is_none() && !self.dash)
+                    let folding = self.sessions[i].check_compacting();
+                    agent || status || folding || (i == self.sel && self.diff.is_none() && !self.dash)
                 }
                 None => false,
             },
@@ -591,6 +594,9 @@ impl App {
             if self.sessions[i].on_tick() {
                 self.check_status(i);
             }
+            // the output that takes the compaction hint off the screen can be the last one for
+            // a while, and may fall inside the check's own quiet window, so look again here
+            self.sessions[i].check_compacting();
         }
         let every = if self.dash { 2 } else { 3 };
         if self.last_usage.elapsed() >= every * TICK {

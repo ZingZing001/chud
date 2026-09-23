@@ -219,6 +219,9 @@ pub struct Session {
     pub resume: Option<(Agent, String, PathBuf)>,
     /// the agent a script or interpreter in front is running, read from its command line
     fg_script: Option<Agent>,
+    /// the agent is folding the conversation down to fit; checked from the screen, not often
+    compacting: bool,
+    compact_checked: Instant,
     activity: Activity,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
@@ -326,6 +329,8 @@ impl Session {
             found: None,
             resume: None,
             fg_script: None,
+            compacting: false,
+            compact_checked: Instant::now(),
             activity: Activity::default(),
             writer,
             master: pair.master,
@@ -534,6 +539,26 @@ impl Session {
             self.usage.context = used;
             self.usage.window = window;
         }
+    }
+
+    pub fn compacting(&self) -> bool {
+        self.compacting
+    }
+
+    /// Is the agent compacting? Nothing reports it — no hook, no escape sequence — so this reads
+    /// what is on screen, at most three times a second and only for an agent that says so.
+    /// ponytail: Claude's wording; other agents simply never show the treadmill.
+    pub fn check_compacting(&mut self) -> bool {
+        if self.exit.is_some() || self.agent != Agent::Claude {
+            return std::mem::take(&mut self.compacting);
+        }
+        if self.compact_checked.elapsed() < Duration::from_millis(300) {
+            return false;
+        }
+        self.compact_checked = Instant::now();
+        let screen = self.parser.lock().unwrap().screen().contents();
+        let now = screen.contains("Compacting conversation") || screen.contains("Compacting at auto window");
+        std::mem::replace(&mut self.compacting, now) != now
     }
 
     pub fn reap(&mut self) {

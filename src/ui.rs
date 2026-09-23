@@ -111,8 +111,10 @@ fn tokens(n: u64) -> String {
     }
 }
 
-fn mood(s: Status) -> Mood {
-    match s {
+fn mood(s: &Session) -> Mood {
+    match s.status() {
+        // compacting comes first: it is what the agent is doing, whatever else is true
+        _ if s.compacting() => Mood::Running,
         Status::Working => Mood::Munching,
         Status::NeedsInput => Mood::Waiting,
         Status::Exited => Mood::Sleepy,
@@ -126,7 +128,7 @@ fn fullness(s: &Session) -> f64 {
 }
 
 fn chud_art(s: &Session) -> Vec<Line<'static>> {
-    chud::art(&chud::sprite(chud::fatness(s.worked()), mood(s.status()), now_secs()))
+    chud::art(&chud::sprite(chud::fatness(s.worked()), mood(s), now_secs()))
 }
 
 /// Block glyphs (▀ ▄ █) only where the font is known to draw them inside their cell: chud.app
@@ -413,6 +415,16 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: 
                 }
                 (true, None, _) => spans.push("5h limit shows after Claude's next reply".fg(pal().dim)),
                 (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(pal().dim)),
+            }
+            // and the session's own chud, as fat as its context is full, so you can read how
+            // much room is left at a glance — running on a treadmill while it compacts
+            let used = fullness(s);
+            let width: u16 = spans.iter().map(|sp| sp.width() as u16).sum();
+            if area.width > width + 18 {
+                spans.push("   context ".fg(pal().dim));
+                spans.extend(chud::mini((used * 5.0) as usize, mood(s), now_secs()));
+                let note = if s.compacting() { " compacting".to_string() } else { format!(" {:.0}%", used * 100.0) };
+                spans.push(note.fg(pal().dim));
             }
         }
         Agent::Profile(_) | Agent::Shell | Agent::Other(_) => {

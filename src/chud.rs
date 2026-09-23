@@ -24,6 +24,8 @@ const EYE: Color = Color::Rgb(0x2b, 0x1d, 0x16);
 const SHINE: Color = Color::Rgb(0xff, 0xff, 0xff);
 const BLUSH: Color = Color::Rgb(0xff, 0x8f, 0xa8);
 const MOUTH: Color = Color::Rgb(0x9c, 0x33, 0x3f);
+const TREAD: Color = Color::Rgb(0x3a, 0x3a, 0x44); // the treadmill it runs on while compacting
+const BELT: Color = Color::Rgb(0x7a, 0x7a, 0x8c); // its moving markings
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mood {
@@ -31,6 +33,8 @@ pub enum Mood {
     Waiting,
     Happy,
     Sleepy,
+    /// on a treadmill: the agent is compacting, working off what it ate
+    Running,
 }
 
 /// 0..=4 by minutes the agent has spent working: snack, meal, feast, buffet, food coma.
@@ -57,7 +61,9 @@ fn put(px: &mut Pixels, x: usize, y: usize, c: Color) {
 pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
     let fat = fat.min(4);
     let (h, w) = (10, 10 + 2 * fat);
-    let body_h = h - 1; // the bottom row is feet
+    let running = mood == Mood::Running;
+    // the bottom row is feet, or the treadmill the feet run on
+    let body_h = if running { h - 2 } else { h - 1 };
     let inside = |x: isize, y: isize| {
         if x < 0 || y < 0 || x >= w as isize || y >= body_h as isize {
             return false;
@@ -107,14 +113,29 @@ pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
         Mood::Munching if chewing => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
         Mood::Munching | Mood::Sleepy => vec![(c0, 6, EDGE), (c1, 6, EDGE)],
         Mood::Waiting => vec![(c0, 6, MOUTH), (c1, 6, MOUTH)],
+        // panting, open wider on the stride where both feet are down
+        Mood::Running if frame % 2 == 0 => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
+        Mood::Running => vec![(c0, 6, MOUTH), (c1, 6, MOUTH)],
         Mood::Happy => vec![(c0 - 1, 5, EYE), (c1 + 1, 5, EYE), (c0, 6, EYE), (c1, 6, EYE)],
     };
     for (x, y, c) in mouth {
         put(&mut px, x, y, c);
     }
     let foot = c0 - 1 - fat / 2;
-    for x in [foot - 1, foot, w - 1 - foot, w - foot] {
-        put(&mut px, x, h - 1, EDGE);
+    if running {
+        // one leg reaches forward while the other pushes back, and they swap every frame,
+        // over a belt whose markings crawl the other way
+        let step: isize = if frame % 2 == 0 { 1 } else { -1 };
+        for (x, dir) in [(foot - 1, -step), (foot, -step), (w - 1 - foot, step), (w - foot, step)] {
+            put(&mut px, x.saturating_add_signed(dir), h - 2, EDGE);
+        }
+        for x in 0..w {
+            put(&mut px, x, h - 1, if (x + frame as usize) % 4 < 2 { BELT } else { TREAD });
+        }
+    } else {
+        for x in [foot - 1, foot, w - 1 - foot, w - foot] {
+            put(&mut px, x, h - 1, EDGE);
+        }
     }
     px
 }
@@ -151,7 +172,9 @@ pub fn lines_safe(px: &Pixels) -> Vec<Line<'static>> {
         Some(MOUTH) => 5,
         Some(BLUSH) => 4,
         Some(EDGE) => 3,
+        Some(BELT) => 3,
         Some(BELLY) => 2,
+        Some(TREAD) => 2,
         Some(_) => 1,
     };
     px.chunks(2)
@@ -166,6 +189,28 @@ pub fn lines_safe(px: &Pixels) -> Vec<Line<'static>> {
             Line::from(cells.collect::<Vec<_>>())
         })
         .collect()
+}
+
+/// A one-line chud, for a session's header: it fattens with how full the context is, and runs
+/// on a treadmill while the agent compacts. Two pixel rows make one text line.
+pub fn mini(fat: usize, mood: Mood, frame: u64) -> Vec<Span<'static>> {
+    let w = 4 + fat.min(4);
+    let mut px: Pixels = vec![vec![Some(BODY); w]; 2];
+    let (left, right) = (w / 2 - 1, w / 2);
+    let eye = if mood == Mood::Sleepy { EDGE } else { EYE };
+    put(&mut px, left, 0, eye);
+    put(&mut px, right, 0, eye);
+    for x in 0..w {
+        // running: the belt crawls under it; otherwise its belly, pale against the body
+        let below = match mood {
+            Mood::Running if (x + frame as usize) % 4 < 2 => BELT,
+            Mood::Running => TREAD,
+            _ if x == 0 || x == w - 1 => EDGE,
+            _ => BELLY,
+        };
+        put(&mut px, x, 1, below);
+    }
+    art(&px).remove(0).spans
 }
 
 /// A progress bar whose fill runs green → amber → red across its own length, so how full it is
@@ -217,6 +262,8 @@ mod tests {
             Some(BODY) => 'o',
             Some(EDGE) => '#',
             Some(BELLY) => '.',
+        Some(TREAD) => '=',
+        Some(BELT) => '-',
             Some(EYE) => '@',
             Some(SHINE) => '*',
             Some(BLUSH) => '+',
@@ -241,6 +288,35 @@ mod tests {
         assert_eq!(sprite(1, Mood::Happy, 0), sprite(1, Mood::Happy, 1));
     }
 
+    /// The treadmill: a belt under its feet, both legs on the ground and in view, and every
+    /// frame different from the last, which is the only thing that makes it look like running.
+    #[test]
+    fn runs_on_a_treadmill_while_compacting() {
+        for fat in 0..=4 {
+            let (a, b) = (sprite(fat, Mood::Running, 0), sprite(fat, Mood::Running, 1));
+            assert_ne!(a, b, "fat {fat}: the stride moves");
+            for (frame, px) in [(0, &a), (1, &b)] {
+                let belt = px.last().unwrap();
+                assert!(belt.iter().all(|c| matches!(c, Some(BELT) | Some(TREAD))), "the belt runs the full width");
+                assert!(belt.contains(&Some(BELT)) && belt.contains(&Some(TREAD)), "the markings show up");
+                let legs = px[px.len() - 2].iter().filter(|c| **c == Some(EDGE)).count();
+                assert_eq!(legs, 4, "fat {fat} frame {frame}: both legs stand on the belt");
+            }
+            assert_eq!(lines(&a).len(), 5, "still fits the card");
+        }
+    }
+
+    #[test]
+    fn the_header_chud_is_one_line() {
+        for fat in 0..=4 {
+            let spans = mini(fat, Mood::Happy, 0);
+            assert_eq!(spans.iter().map(|s| s.content.chars().count()).sum::<usize>(), 4 + fat, "fatter with context");
+            assert!(spans.iter().any(|s| s.style.fg == Some(EYE)), "it has eyes");
+        }
+        assert_eq!(mini(9, Mood::Happy, 0).len(), mini(4, Mood::Happy, 0).len(), "nonsense fatness is clamped");
+        assert_ne!(mini(2, Mood::Running, 0), mini(2, Mood::Running, 1), "and it runs on the spot too");
+    }
+
     #[test]
     fn progress_bar() {
         let text = |r, w| bar(r, w).iter().map(|s| s.content.as_ref()).collect::<String>();
@@ -258,7 +334,8 @@ mod tests {
     #[test]
     fn safe_style() {
         let text = |ls: &[Line]| ls.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect::<String>();
-        let moods = [(Mood::Happy, 0), (Mood::Munching, 0), (Mood::Munching, 1), (Mood::Waiting, 0), (Mood::Sleepy, 0)];
+        let moods = [(Mood::Happy, 0), (Mood::Munching, 0), (Mood::Munching, 1), (Mood::Waiting, 0),
+                     (Mood::Sleepy, 0), (Mood::Running, 0), (Mood::Running, 1)];
         let mut seen = std::collections::HashSet::new();
         for fat in 0..=4 {
             for (mood, frame) in moods {
@@ -289,10 +366,12 @@ mod tests {
             let as_px: Pixels = lines_safe(px).iter().map(|l| l.spans.iter().map(|s| s.style.bg).collect()).collect();
             ascii(&as_px)
         };
-        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy] {
+        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy, Mood::Running] {
             for fat in [0, 2, 4] {
-                let px = sprite(fat, mood, 0);
-                println!("{mood:?} fat {fat}\n{}safe:\n{}", ascii(&px), safe(&px));
+                for frame in 0..=1 {
+                    let px = sprite(fat, mood, frame);
+                    println!("{mood:?} fat {fat} frame {frame}\n{}safe:\n{}", ascii(&px), safe(&px));
+                }
             }
         }
     }
