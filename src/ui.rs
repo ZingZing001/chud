@@ -323,8 +323,8 @@ fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
     for (id, rect) in app.layout.rects(main) {
         let Some(i) = app.sessions.iter().position(|s| s.id == id) else { continue };
         let s = &app.sessions[i];
-        let [head, term] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(rect);
-        session_header(f, s, &app.plan, head, split && i == app.sel);
+        let [head, term] = Layout::vertical([Constraint::Length(header_rows(s)), Constraint::Min(1)]).areas(rect);
+        session_header(f, s, &app.plan, head, split && i == app.sel, split);
         if split {
             // one click to take this session off screen; it keeps running in the sidebar
             let close = Rect::new(head.right().saturating_sub(3), head.y, 3.min(head.width), 1);
@@ -387,10 +387,16 @@ fn grip(f: &mut Frame, rect: Rect, vertical: bool, held: bool) {
 /// Claude's rolling 5-hour limit (plus the week), Copilot's monthly premium requests. It follows
 /// whichever agent is in front, including one started by hand in a shell. (Context fullness
 /// lives in the sidebar.)
-fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: bool) {
+/// How many rows a session's header takes. An agent gets a second one for its context and its
+/// chud; a shell has neither, so it keeps the single line and the terminal keeps the row.
+pub fn header_rows(s: &Session) -> u16 {
+    if has_usage(s) { 2 } else { 1 }
+}
+
+fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: bool, split: bool) {
     // in a split, a bar in the accent colour marks the pane your typing goes to
-    let lead = if focused { "▌".fg(pal().accent) } else { Span::raw(" ") };
-    let mut spans = vec![lead, icon(&s.agent)];
+    let lead = || if focused { "▌".fg(pal().accent) } else { Span::raw(" ") };
+    let mut spans = vec![lead(), icon(&s.agent)];
     match &s.agent {
         Agent::Claude | Agent::Copilot => {
             let claude = s.agent == Agent::Claude;
@@ -416,16 +422,6 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: 
                 (true, None, _) => spans.push("5h limit shows after Claude's next reply".fg(pal().dim)),
                 (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(pal().dim)),
             }
-            // and the session's own chud, as fat as its context is full, so you can read how
-            // much room is left at a glance — running on a treadmill while it compacts
-            let used = fullness(s);
-            let width: u16 = spans.iter().map(|sp| sp.width() as u16).sum();
-            if area.width > width + 18 {
-                spans.push("   context ".fg(pal().dim));
-                spans.extend(chud::mini((used * 5.0) as usize, mood(s), now_secs()));
-                let note = if s.compacting() { " compacting".to_string() } else { format!(" {:.0}%", used * 100.0) };
-                spans.push(note.fg(pal().dim));
-            }
         }
         Agent::Profile(_) | Agent::Shell | Agent::Other(_) => {
             let program = match &s.agent {
@@ -436,7 +432,28 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: 
             spans.push(format!("{program} · {}", s.cwd.display()).fg(pal().dim));
         }
     }
-    f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), area);
+    let [top, second] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), top);
+    if second.height == 0 {
+        return; // a shell: one line, and the terminal keeps the row
+    }
+    // Row two: how full the context is, and the session's own chud — the dashboard's creature
+    // at header size, as fat as the context it has eaten, running while the agent compacts.
+    let used = fullness(s);
+    let mut below = vec![lead(), Span::raw("  "), "context ".fg(pal().dim)];
+    below.extend(chud::bar(used, (area.width / 6).clamp(8, 20) as usize));
+    below.push(format!(" {:.0}%", used * 100.0).into());
+    below.push(format!("  {} of {}", tokens(s.usage.context), tokens(s.usage.limit())).fg(pal().dim));
+    if s.compacting() {
+        below.push("  compacting…".fg(pal().accent));
+    }
+    f.render_widget(Line::from(below).fg(pal().bar_fg).bg(pal().bar_bg), second);
+    let art = chud::small((used * 5.0) as usize, mood(s), now_secs());
+    let (w, gap) = (art[0].width() as u16, if split { 4 } else { 1 }); // clear of the ✕ button
+    if area.width > w + gap + 44 {
+        let at = Rect::new(area.right() - w - gap, area.y, w, 2.min(area.height));
+        f.render_widget(Paragraph::new(art), at);
+    }
 }
 
 fn toolbar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {

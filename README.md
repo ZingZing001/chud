@@ -25,7 +25,7 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 | **Copy and paste** | Drag over the terminal to select and copy; ⌘V pastes. `C-a y` copies the whole session view. |
 | **Mouse-first UI** | Toolbar, `…` and right-click menus, drag and drop, resizable sidebar. Every action also has a keyboard shortcut. |
 | **Restore on restart** | Layout, groups, names and agent chats come back the next time you run `chud` — including a Claude or Copilot chat you started by hand in a terminal, which reopens in the folder it ran in. |
-| **A chud per session** | Its size in the session header tracks how full the context is, and it runs on a treadmill while Claude compacts the conversation. The dashboard shows the full-size one. |
+| **A chud per session** | Every agent's header carries its own chud, as fat as its context is full, running on a treadmill while Claude compacts the conversation. The dashboard shows the full-size one. |
 | **Fast & idle-friendly** | Draws only when something changes; release builds use fat LTO. |
 
 ## Installation

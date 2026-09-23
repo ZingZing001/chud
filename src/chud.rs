@@ -191,26 +191,48 @@ pub fn lines_safe(px: &Pixels) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A one-line chud, for a session's header: it fattens with how full the context is, and runs
-/// on a treadmill while the agent compacts. Two pixel rows make one text line.
-pub fn mini(fat: usize, mood: Mood, frame: u64) -> Vec<Span<'static>> {
-    let w = 4 + fat.min(4);
-    let mut px: Pixels = vec![vec![Some(BODY); w]; 2];
-    let (left, right) = (w / 2 - 1, w / 2);
-    let eye = if mood == Mood::Sleepy { EDGE } else { EYE };
-    put(&mut px, left, 0, eye);
-    put(&mut px, right, 0, eye);
-    for x in 0..w {
-        // running: the belt crawls under it; otherwise its belly, pale against the body
-        let below = match mood {
-            Mood::Running if (x + frame as usize) % 4 < 2 => BELT,
-            Mood::Running => TREAD,
-            _ if x == 0 || x == w - 1 => EDGE,
-            _ => BELLY,
-        };
-        put(&mut px, x, 1, below);
+/// The chud at header size: the same creature as the dashboard's, four pixel rows drawn into
+/// two text lines. It widens as the context fills, and runs on a belt while the agent compacts.
+pub fn small(fat: usize, mood: Mood, frame: u64) -> Vec<Line<'static>> {
+    art(&small_px(fat, mood, frame))
+}
+
+fn small_px(fat: usize, mood: Mood, frame: u64) -> Pixels {
+    let w = 6 + fat.min(4);
+    let mut px: Pixels = vec![vec![None; w]; 4];
+    for x in 1..w - 1 {
+        put(&mut px, x, 0, EDGE); // the top of its head, corners left round
     }
-    art(&px).remove(0).spans
+    for x in 0..w {
+        let rim = x == 0 || x == w - 1;
+        put(&mut px, x, 1, if rim { EDGE } else { BODY });
+        put(&mut px, x, 2, if rim { EDGE } else { BELLY });
+    }
+    // eyes either side of the middle, feet below them, as on the big one
+    let (left, right) = (w / 2 - 2, w / 2 + 1);
+    let eye = if mood == Mood::Sleepy { EDGE } else { EYE };
+    put(&mut px, left, 1, eye);
+    put(&mut px, right, 1, eye);
+    // the mouth works while it does: chewing and panting open and close it
+    let busy = matches!(mood, Mood::Munching | Mood::Running);
+    if mood != Mood::Sleepy && (!busy || frame % 2 == 0) {
+        put(&mut px, w / 2 - 1, 2, MOUTH);
+        put(&mut px, w / 2, 2, MOUTH);
+    }
+    if mood == Mood::Running {
+        // every other cell, so the feet can never sit on all the markings at once and leave
+        // the belt looking still — at six cells wide there are only three of them
+        for x in 0..w {
+            put(&mut px, x, 3, if (x + frame as usize) % 2 == 0 { BELT } else { TREAD });
+        }
+        let stride = usize::from(frame % 2 == 0); // feet travel along the belt
+        put(&mut px, left + stride, 3, EDGE);
+        put(&mut px, right - stride, 3, EDGE);
+    } else {
+        put(&mut px, left, 3, EDGE);
+        put(&mut px, right, 3, EDGE);
+    }
+    px
 }
 
 /// A progress bar whose fill runs green → amber → red across its own length, so how full it is
@@ -306,15 +328,29 @@ mod tests {
         }
     }
 
+    /// The header chud is the dashboard's, shrunk: a whole creature — head, eyes, mouth and
+    /// feet — in two lines, that fattens with the context and runs while compacting.
     #[test]
-    fn the_header_chud_is_one_line() {
+    fn the_header_chud_is_a_whole_chud() {
         for fat in 0..=4 {
-            let spans = mini(fat, Mood::Happy, 0);
-            assert_eq!(spans.iter().map(|s| s.content.chars().count()).sum::<usize>(), 4 + fat, "fatter with context");
-            assert!(spans.iter().any(|s| s.style.fg == Some(EYE)), "it has eyes");
+            let ls = small(fat, Mood::Happy, 0);
+            assert_eq!(ls.len(), 2, "two text lines");
+            assert!(ls.iter().all(|l| l.width() == 6 + fat), "fat {fat}: fatter with context");
+            let seen = |c: Color| ls.iter().flat_map(|l| l.spans.iter()).any(|s| s.style.fg == Some(c) || s.style.bg == Some(c));
+            for (part, colour) in [("eyes", EYE), ("mouth", MOUTH), ("belly", BELLY), ("feet", EDGE), ("body", BODY)] {
+                assert!(seen(colour), "fat {fat}: the {part} made it in");
+            }
         }
-        assert_eq!(mini(9, Mood::Happy, 0).len(), mini(4, Mood::Happy, 0).len(), "nonsense fatness is clamped");
-        assert_ne!(mini(2, Mood::Running, 0), mini(2, Mood::Running, 1), "and it runs on the spot too");
+        assert_eq!(small(9, Mood::Happy, 0)[0].width(), small(4, Mood::Happy, 0)[0].width(), "nonsense fatness is clamped");
+        assert_ne!(small(2, Mood::Running, 0), small(2, Mood::Running, 1), "and it runs on the spot too");
+        // the feet must never cover every marking, or the belt looks like it stopped
+        for fat in 0..=4 {
+            for frame in 0..8 {
+                let px = small_px(fat, Mood::Running, frame);
+                let belt = px.last().unwrap().iter().filter(|c| **c == Some(BELT)).count();
+                assert!(belt > 0, "fat {fat} frame {frame}: the belt still shows it moving");
+            }
+        }
     }
 
     #[test]
@@ -372,6 +408,13 @@ mod tests {
                     let px = sprite(fat, mood, frame);
                     println!("{mood:?} fat {fat} frame {frame}\n{}safe:\n{}", ascii(&px), safe(&px));
                 }
+            }
+        }
+        // the header one, in the same letters
+        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy, Mood::Running] {
+            for frame in 0..=1 {
+                let px = small_px(2, mood, frame);
+                println!("small {mood:?} frame {frame}\n{}", ascii(&px));
             }
         }
     }

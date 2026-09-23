@@ -998,7 +998,8 @@ impl App {
             let size = panes
                 .iter()
                 .find(|(id, _)| *id == s.id)
-                .map_or(whole, |(_, r)| (r.height.saturating_sub(1).max(4), r.width.max(20))); // a header row above each
+                // the header above each pane takes one row, or two for an agent
+                .map_or(whole, |(_, r)| (r.height.saturating_sub(ui::header_rows(s)).max(4), r.width.max(20)));
             s.resize(size);
         }
     }
