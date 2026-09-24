@@ -114,11 +114,12 @@ pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
     put(&mut px, left - 1, 5, BLUSH);
     put(&mut px, right + 1, 5, BLUSH);
     if mood == Mood::Petted {
-        // and brings the colour to its cheeks
-        put(&mut px, left - 1, 4, BLUSH);
-        put(&mut px, right + 1, 4, BLUSH);
+        // and brings the colour to its cheeks — below the eyes, never over them: rows 3 and 4
+        // are the eyes themselves, and painting one pink looks like a blindfold, not a blush
         put(&mut px, left - 2, 5, BLUSH);
         put(&mut px, right + 2, 5, BLUSH);
+        put(&mut px, left - 1, 6, BLUSH);
+        put(&mut px, right + 1, 6, BLUSH);
     }
     let mouth = match mood {
         Mood::Munching if chewing => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
@@ -223,9 +224,10 @@ fn small_px(fat: usize, mood: Mood, frame: u64) -> Pixels {
     }
     // eyes either side of the middle, feet below them, as on the big one
     let (left, right) = (w / 2 - 2, w / 2 + 1);
-    // petted: eyes squeezed shut every other frame, and pink cheeks where there is room
-    let shut = mood == Mood::Sleepy || (mood == Mood::Petted && frame % 2 == 0);
-    let eye = if shut { EDGE } else { EYE };
+    // At one pixel an eye, a squint is indistinguishable from the rim it is drawn in — the
+    // face just loses its eyes — so only sleep closes them here. Petting shows in the cheeks
+    // and the grin instead.
+    let eye = if mood == Mood::Sleepy { EDGE } else { EYE };
     put(&mut px, left, 1, eye);
     put(&mut px, right, 1, eye);
     if mood == Mood::Petted {
@@ -238,8 +240,8 @@ fn small_px(fat: usize, mood: Mood, frame: u64) -> Pixels {
     if mood != Mood::Sleepy && (!busy || frame % 2 == 0) {
         put(&mut px, w / 2 - 1, 2, MOUTH);
         put(&mut px, w / 2, 2, MOUTH);
-        if mood == Mood::Petted {
-            put(&mut px, w / 2 - 2, 2, MOUTH); // grinning
+        if mood == Mood::Petted && frame % 2 == 0 {
+            put(&mut px, w / 2 - 2, 2, MOUTH); // the grin spreads and settles again
             put(&mut px, w / 2 + 1, 2, MOUTH);
         }
     }
@@ -377,6 +379,10 @@ mod tests {
         }
     }
 
+    fn w(fat: usize) -> usize {
+        10 + 2 * fat
+    }
+
     /// Petting it has to be visible, or clicking the thing does nothing you can see: rosy
     /// cheeks, a wider grin, and eyes that squeeze shut and open again.
     #[test]
@@ -389,13 +395,23 @@ mod tests {
             assert!(blush(&pet) > blush(&happy), "fat {fat}: rosier than usual");
             let shut = pet.iter().flatten().filter(|c| **c == Some(SHINE)).count();
             assert_eq!(shut, 0, "fat {fat}: eyes squeezed shut on this frame");
+            // the cheeks must not land on the eyes, which would read as a blindfold
+            let (open, d) = (sprite(fat, Mood::Petted, 1), 1 + fat / 2);
+            let (l, r) = (w(fat) / 2 - 1 - d, w(fat) / 2 + d);
+            for (x, y) in [(l, 3), (l - 1, 3), (l, 4), (l - 1, 4), (r, 3), (r + 1, 3), (r, 4), (r + 1, 4)] {
+                assert!(matches!(open[y][x], Some(EYE) | Some(SHINE)), "fat {fat}: ({x},{y}) is still an eye");
+            }
         }
         for fat in 0..=4 {
             assert_ne!(small(fat, Mood::Petted, 0), small(fat, Mood::Happy, 0), "the header one reacts too");
             assert_ne!(small(fat, Mood::Petted, 0), small(fat, Mood::Petted, 1));
             // even at its thinnest it must go pink, or a click on a fresh session does nothing
-            let pink = small_px(fat, Mood::Petted, 0).iter().flatten().filter(|c| **c == Some(BLUSH)).count();
+            let px = small_px(fat, Mood::Petted, 0);
+            let pink = px.iter().flatten().filter(|c| **c == Some(BLUSH)).count();
             assert_eq!(pink, 2, "fat {fat}: two cheeks, whatever the width");
+            // and the cheeks must not take an eye's place: one pixel an eye, none to spare
+            let eyes = px[1].iter().filter(|c| **c == Some(EYE)).count();
+            assert_eq!(eyes, 2, "fat {fat}: both eyes still there while being petted");
         }
     }
 
