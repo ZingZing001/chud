@@ -35,6 +35,8 @@ pub enum Mood {
     Sleepy,
     /// on a treadmill: the agent is compacting, working off what it ate
     Running,
+    /// you just petted it
+    Petted,
 }
 
 /// 0..=4 by minutes the agent has spent working: snack, meal, feast, buffet, food coma.
@@ -99,8 +101,10 @@ pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
 
     let (c0, c1, d) = (w / 2 - 1, w / 2, 1 + fat / 2);
     let (left, right) = (c0 - d, c1 + d); // inner pixel of each 2x2 eye
+    // petting squeezes its eyes shut with pleasure, every other frame
+    let squinting = mood == Mood::Petted && frame % 2 == 0;
     for (inner, outer) in [(left, left - 1), (right, right + 1)] {
-        if mood != Mood::Sleepy {
+        if mood != Mood::Sleepy && !squinting {
             put(&mut px, inner, 3, SHINE);
             put(&mut px, outer, 3, EYE);
         }
@@ -109,6 +113,13 @@ pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
     }
     put(&mut px, left - 1, 5, BLUSH);
     put(&mut px, right + 1, 5, BLUSH);
+    if mood == Mood::Petted {
+        // and brings the colour to its cheeks
+        put(&mut px, left - 1, 4, BLUSH);
+        put(&mut px, right + 1, 4, BLUSH);
+        put(&mut px, left - 2, 5, BLUSH);
+        put(&mut px, right + 2, 5, BLUSH);
+    }
     let mouth = match mood {
         Mood::Munching if chewing => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
         Mood::Munching | Mood::Sleepy => vec![(c0, 6, EDGE), (c1, 6, EDGE)],
@@ -116,6 +127,8 @@ pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
         // panting, open wider on the stride where both feet are down
         Mood::Running if frame % 2 == 0 => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
         Mood::Running => vec![(c0, 6, MOUTH), (c1, 6, MOUTH)],
+        // a wide smile, wider than happy: the corners lift another pixel
+        Mood::Petted => vec![(c0 - 2, 5, EYE), (c1 + 2, 5, EYE), (c0 - 1, 6, EYE), (c1 + 1, 6, EYE), (c0, 6, EYE), (c1, 6, EYE)],
         Mood::Happy => vec![(c0 - 1, 5, EYE), (c1 + 1, 5, EYE), (c0, 6, EYE), (c1, 6, EYE)],
     };
     for (x, y, c) in mouth {
@@ -210,14 +223,25 @@ fn small_px(fat: usize, mood: Mood, frame: u64) -> Pixels {
     }
     // eyes either side of the middle, feet below them, as on the big one
     let (left, right) = (w / 2 - 2, w / 2 + 1);
-    let eye = if mood == Mood::Sleepy { EDGE } else { EYE };
+    // petted: eyes squeezed shut every other frame, and pink cheeks where there is room
+    let shut = mood == Mood::Sleepy || (mood == Mood::Petted && frame % 2 == 0);
+    let eye = if shut { EDGE } else { EYE };
     put(&mut px, left, 1, eye);
     put(&mut px, right, 1, eye);
+    if mood == Mood::Petted {
+        // cheeks beside the eyes, or on the rim itself when it is too thin to have room
+        put(&mut px, left.saturating_sub(1), 1, BLUSH);
+        put(&mut px, (right + 1).min(w - 1), 1, BLUSH);
+    }
     // the mouth works while it does: chewing and panting open and close it
     let busy = matches!(mood, Mood::Munching | Mood::Running);
     if mood != Mood::Sleepy && (!busy || frame % 2 == 0) {
         put(&mut px, w / 2 - 1, 2, MOUTH);
         put(&mut px, w / 2, 2, MOUTH);
+        if mood == Mood::Petted {
+            put(&mut px, w / 2 - 2, 2, MOUTH); // grinning
+            put(&mut px, w / 2 + 1, 2, MOUTH);
+        }
     }
     if mood == Mood::Running {
         // every other cell, so the feet can never sit on all the markings at once and leave
@@ -353,6 +377,28 @@ mod tests {
         }
     }
 
+    /// Petting it has to be visible, or clicking the thing does nothing you can see: rosy
+    /// cheeks, a wider grin, and eyes that squeeze shut and open again.
+    #[test]
+    fn petting_shows_on_both_sizes() {
+        for fat in 0..=4 {
+            let (pet, happy) = (sprite(fat, Mood::Petted, 0), sprite(fat, Mood::Happy, 0));
+            assert_ne!(pet, happy, "fat {fat}: petted looks different from merely content");
+            assert_ne!(pet, sprite(fat, Mood::Petted, 1), "fat {fat}: its eyes open and shut");
+            let blush = |px: &Pixels| px.iter().flatten().filter(|c| **c == Some(BLUSH)).count();
+            assert!(blush(&pet) > blush(&happy), "fat {fat}: rosier than usual");
+            let shut = pet.iter().flatten().filter(|c| **c == Some(SHINE)).count();
+            assert_eq!(shut, 0, "fat {fat}: eyes squeezed shut on this frame");
+        }
+        for fat in 0..=4 {
+            assert_ne!(small(fat, Mood::Petted, 0), small(fat, Mood::Happy, 0), "the header one reacts too");
+            assert_ne!(small(fat, Mood::Petted, 0), small(fat, Mood::Petted, 1));
+            // even at its thinnest it must go pink, or a click on a fresh session does nothing
+            let pink = small_px(fat, Mood::Petted, 0).iter().flatten().filter(|c| **c == Some(BLUSH)).count();
+            assert_eq!(pink, 2, "fat {fat}: two cheeks, whatever the width");
+        }
+    }
+
     #[test]
     fn progress_bar() {
         let text = |r, w| bar(r, w).iter().map(|s| s.content.as_ref()).collect::<String>();
@@ -371,7 +417,8 @@ mod tests {
     fn safe_style() {
         let text = |ls: &[Line]| ls.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect::<String>();
         let moods = [(Mood::Happy, 0), (Mood::Munching, 0), (Mood::Munching, 1), (Mood::Waiting, 0),
-                     (Mood::Sleepy, 0), (Mood::Running, 0), (Mood::Running, 1)];
+                     (Mood::Sleepy, 0), (Mood::Running, 0), (Mood::Running, 1),
+                     (Mood::Petted, 0), (Mood::Petted, 1)];
         let mut seen = std::collections::HashSet::new();
         for fat in 0..=4 {
             for (mood, frame) in moods {
@@ -402,7 +449,7 @@ mod tests {
             let as_px: Pixels = lines_safe(px).iter().map(|l| l.spans.iter().map(|s| s.style.bg).collect()).collect();
             ascii(&as_px)
         };
-        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy, Mood::Running] {
+        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy, Mood::Running, Mood::Petted] {
             for fat in [0, 2, 4] {
                 for frame in 0..=1 {
                     let px = sprite(fat, mood, frame);
@@ -411,7 +458,7 @@ mod tests {
             }
         }
         // the header one, in the same letters
-        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy, Mood::Running] {
+        for mood in [Mood::Happy, Mood::Munching, Mood::Waiting, Mood::Sleepy, Mood::Running, Mood::Petted] {
             for frame in 0..=1 {
                 let px = small_px(2, mood, frame);
                 println!("small {mood:?} frame {frame}\n{}", ascii(&px));

@@ -155,6 +155,8 @@ enum Hit {
     Divider(usize),
     /// the ✕ on a pane's header
     ClosePane(usize),
+    /// the chud on a pane's header, which you can pet
+    Pet(usize),
     Backdrop,
     SetupChoice(usize),
     SetupBack,
@@ -473,7 +475,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         // timing, wake once a second. Then drain and draw once.
         let ticking = app.dash
             || app.sessions.iter().any(|s| {
-                s.working_since.is_some() || s.status() == Status::NeedsInput || s.compacting()
+                s.working_since.is_some() || s.status() == Status::NeedsInput || s.compacting() || s.petted()
             });
         let first = if ticking { rx.recv_timeout(TICK).ok() } else { Some(rx.recv()?) };
         let mut dirty = first.is_some_and(|e| app.handle(e));
@@ -1662,6 +1664,7 @@ impl App {
                 self.to_pane(m, i);
             }
             Some(Hit::ClosePane(i)) => self.close_pane(i),
+            Some(Hit::Pet(i)) => self.sessions[i].pet(),
             Some(h @ Hit::Divider(_)) => self.drag = Some(Drag { from: h, at: (m.column, m.row), moved: false }),
             _ => {}
         }

@@ -113,7 +113,9 @@ fn tokens(n: u64) -> String {
 
 fn mood(s: &Session) -> Mood {
     match s.status() {
-        // compacting comes first: it is what the agent is doing, whatever else is true
+        // being petted beats anything the agent is up to: you asked it, and it is brief
+        _ if s.petted() => Mood::Petted,
+        // then compacting: it is what the agent is doing, whatever else is true
         _ if s.compacting() => Mood::Running,
         Status::Working => Mood::Munching,
         Status::NeedsInput => Mood::Waiting,
@@ -324,7 +326,7 @@ fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
         let Some(i) = app.sessions.iter().position(|s| s.id == id) else { continue };
         let s = &app.sessions[i];
         let [head, term] = Layout::vertical([Constraint::Length(header_rows(s)), Constraint::Min(1)]).areas(rect);
-        session_header(f, s, &app.plan, head, split && i == app.sel, split);
+        session_header(f, s, i, &app.plan, head, split && i == app.sel, split, hits);
         if split {
             // one click to take this session off screen; it keeps running in the sidebar
             let close = Rect::new(head.right().saturating_sub(3), head.y, 3.min(head.width), 1);
@@ -393,7 +395,7 @@ pub fn header_rows(s: &Session) -> u16 {
     if has_usage(s) { 2 } else { 1 }
 }
 
-fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: bool, split: bool) {
+fn session_header(f: &mut Frame, s: &Session, i: usize, plan: &Plan, area: Rect, focused: bool, split: bool, hits: &mut Hits) {
     // in a split, a bar in the accent colour marks the pane your typing goes to
     let lead = || if focused { "▌".fg(pal().accent) } else { Span::raw(" ") };
     let mut spans = vec![lead(), icon(&s.agent)];
@@ -453,6 +455,7 @@ fn session_header(f: &mut Frame, s: &Session, plan: &Plan, area: Rect, focused: 
     if area.width > w + gap + 44 {
         let at = Rect::new(area.right() - w - gap, area.y, w, 2.min(area.height));
         f.render_widget(Paragraph::new(art), at);
+        hits.push((at, Hit::Pet(i))); // it likes being clicked
     }
 }
 

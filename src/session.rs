@@ -219,6 +219,8 @@ pub struct Session {
     pub resume: Option<(Agent, String, PathBuf)>,
     /// the agent a script or interpreter in front is running, read from its command line
     fg_script: Option<Agent>,
+    /// when you last petted it, for the few seconds it looks pleased about it
+    petted: Option<Instant>,
     /// the agent is folding the conversation down to fit; checked from the screen, not often
     compacting: bool,
     compact_checked: Instant,
@@ -329,6 +331,7 @@ impl Session {
             found: None,
             resume: None,
             fg_script: None,
+            petted: None,
             compacting: false,
             compact_checked: Instant::now(),
             activity: Activity::default(),
@@ -543,6 +546,15 @@ impl Session {
 
     pub fn compacting(&self) -> bool {
         self.compacting
+    }
+
+    /// Someone clicked the chud. It enjoys it for a moment.
+    pub fn pet(&mut self) {
+        self.petted = Some(Instant::now());
+    }
+
+    pub fn petted(&self) -> bool {
+        self.petted.is_some_and(|t| t.elapsed() < Duration::from_secs(3))
     }
 
     /// Is the agent compacting? Nothing reports it — no hook, no escape sequence — so this reads
