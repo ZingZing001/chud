@@ -108,7 +108,24 @@ pub fn check_gh() -> Check {
 /// Which of these programs are on your PATH.
 pub fn installed(names: &[&str]) -> Vec<(String, bool)> {
     let dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    names.iter().map(|n| (n.to_string(), dirs.iter().any(|d| d.join(n).is_file()))).collect()
+    let exts = exe_exts(cfg!(windows), std::env::var("PATHEXT").ok().as_deref());
+    names.iter().map(|n| (n.to_string(), on_path(&dirs, n, &exts))).collect()
+}
+
+/// What an executable can be called here. Nothing extra on unix; on Windows the program is
+/// `codex.exe`, not `codex`, so try everything PATHEXT lists — looking only for the bare name
+/// there reports every installed agent as missing.
+fn exe_exts(windows: bool, pathext: Option<&str>) -> Vec<String> {
+    let mut exts = vec![String::new()]; // a bare name still counts: shims often have no extension
+    if windows {
+        let listed = pathext.unwrap_or(".COM;.EXE;.BAT;.CMD");
+        exts.extend(listed.split(';').filter(|e| e.starts_with('.')).map(str::to_lowercase));
+    }
+    exts
+}
+
+fn on_path(dirs: &[PathBuf], name: &str, exts: &[String]) -> bool {
+    dirs.iter().any(|d| exts.iter().any(|e| d.join(format!("{name}{e}")).is_file()))
 }
 
 #[cfg(test)]
@@ -194,6 +211,29 @@ mod tests {
         let made: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(made, json!({ "statusLine": { "type": "command", "command": "/opt/chud --statusline" } }));
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Windows names its executables `codex.exe`; looking for a file called `codex` finds
+    /// nothing and the walkthrough greys out every agent you have installed.
+    #[test]
+    fn finds_windows_executables() {
+        let dir = temp_home("path");
+        std::fs::write(dir.join("codex.exe"), "").unwrap();
+        std::fs::write(dir.join("aider"), "").unwrap();
+        let dirs = vec![dir.clone()];
+
+        let windows = exe_exts(true, None);
+        assert!(on_path(&dirs, "codex", &windows), "codex.exe is codex");
+        assert!(on_path(&dirs, "aider", &windows), "and an extensionless shim still counts");
+        assert!(!on_path(&dirs, "gemini", &windows), "what isn't there isn't found");
+
+        let unix = exe_exts(false, None);
+        assert_eq!(unix, [""], "no extensions are added off Windows");
+        assert!(on_path(&dirs, "aider", &unix));
+
+        assert_eq!(exe_exts(true, None), ["", ".com", ".exe", ".bat", ".cmd"]);
+        assert_eq!(exe_exts(true, Some(".EXE;.PY;")), ["", ".exe", ".py"], "PATHEXT wins, junk dropped");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
