@@ -5,6 +5,15 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// Which agent's log a session's numbers come from. Each writes a different shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Kind {
+    #[default]
+    Claude,
+    Copilot,
+    Codex,
+}
+
 /// Token counts for one agent session, read incrementally from the agent's own log.
 #[derive(Default)]
 pub struct Usage {
@@ -19,8 +28,10 @@ pub struct Usage {
     pub premium: u64,
     /// output tokens per minute (minutes since the Unix epoch), from the log's timestamps
     pub timeline: BTreeMap<u64, u64>,
+    /// codex reports its own plan windows in its log: the 5-hour one, and the week
+    pub limits: Option<(Window, Option<Window>)>,
     prompt_limit: u64,
-    copilot: bool,
+    kind: Kind,
     path: PathBuf,
     offset: u64,
     // claude: finished messages as (input, cache write, cache read, output), plus the latest
@@ -30,12 +41,19 @@ pub struct Usage {
 }
 
 /// Where the agent logs a session: Claude's transcript or Copilot's event stream.
-pub fn log_path(copilot: bool, sid: &str, cwd: &Path) -> Option<PathBuf> {
+pub fn log_path(kind: Kind, sid: &str, cwd: &Path) -> Option<PathBuf> {
     if sid.is_empty() {
         return None;
     }
     let home = crate::config::home();
-    Some(if copilot {
+    if kind == Kind::Codex {
+        // ~/.codex/sessions/2026/09/25/rollout-<when>-<id>.jsonl: the id is in the name, the
+        // date is not something we know, so look for the one file that ends with this id
+        return codex_rollouts(&codex_home()).into_iter().find(|p| {
+            p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&format!("-{sid}.jsonl")))
+        });
+    }
+    Some(if kind == Kind::Copilot {
         home.join(".copilot/session-state").join(sid).join("events.jsonl")
     } else {
         let slug: String =
@@ -54,6 +72,48 @@ pub fn claude_chat_cwd(home: &Path, sid: &str) -> Option<PathBuf> {
     BufReader::new(File::open(file).ok()?).lines().take(50).map_while(Result::ok).find_map(|l| {
         let v: Value = serde_json::from_str(&l).ok()?;
         v["cwd"].as_str().map(PathBuf::from)
+    })
+}
+
+/// Where codex keeps its sessions: `$CODEX_HOME`, as codex itself reads it, else `~/.codex`.
+pub fn codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::home().join(".codex"))
+}
+
+/// Every codex rollout, newest first. Their names start with the time they began
+/// (`rollout-2026-09-25T15-44-32-<id>.jsonl`) under year/month/day folders, so sorting the
+/// paths by name sorts them by age.
+pub fn codex_rollouts(codex_home: &Path) -> Vec<PathBuf> {
+    let list = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default()
+    };
+    let mut files: Vec<PathBuf> = list(&codex_home.join("sessions"))
+        .iter()
+        .flat_map(|y| list(y))
+        .flat_map(|m| list(&m))
+        .flat_map(|d| list(&d))
+        .filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("rollout-")))
+        .collect();
+    files.sort_unstable_by(|a, b| b.cmp(a));
+    files
+}
+
+/// The codex session running in `cwd`: the newest rollout whose first line, the session's
+/// own description of itself, names that folder. Codex picks its ids itself, so chud finds
+/// the session afterwards rather than choosing it up front as it does for Claude.
+pub fn codex_session(codex_home: &Path, cwd: &Path, since: SystemTime) -> Option<String> {
+    codex_rollouts(codex_home).into_iter().take(50).find_map(|f| {
+        // an older session in the same folder, untouched since this codex started, is not it
+        if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < since) {
+            return None;
+        }
+        let first = BufReader::new(File::open(&f).ok()?).lines().next()?.ok()?;
+        let v: Value = serde_json::from_str(&first).ok()?;
+        let meta = &v["payload"];
+        (Path::new(meta["cwd"].as_str()?) == cwd).then(|| meta["id"].as_str().map(String::from))?
     })
 }
 
@@ -100,7 +160,7 @@ impl Usage {
     /// tells a 200K session from a 1M one. The guesses below only cover the moments before the
     /// agent has said anything: its first reply replaces them.
     pub fn limit(&self) -> u64 {
-        match (self.window.max(self.prompt_limit), self.copilot) {
+        match (self.window.max(self.prompt_limit), self.kind == Kind::Copilot) {
             (n, _) if n > 0 => n,
             (_, true) => 128_000,
             // claude runs 200K unless the session opted into the 1M window ("sonnet[1m]")
@@ -109,15 +169,20 @@ impl Usage {
         }
     }
 
+    /// The log being read.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn is_copilot(&self) -> bool {
-        self.copilot
+        self.kind == Kind::Copilot
     }
 
     /// Reads whatever the log gained since the last call; a partial last line waits for its newline.
-    pub fn refresh(&mut self, path: &Path, copilot: bool) {
+    pub fn refresh(&mut self, path: &Path, kind: Kind) {
         let Ok(mut f) = File::open(path) else { return };
         if path != self.path || f.metadata().is_ok_and(|m| m.len() < self.offset) {
-            *self = Usage { path: path.to_path_buf(), copilot, ..Default::default() };
+            *self = Usage { path: path.to_path_buf(), kind, ..Default::default() };
         }
         if f.seek(SeekFrom::Start(self.offset)).is_err() {
             return;
@@ -127,10 +192,14 @@ impl Usage {
         while matches!(reader.read_until(b'\n', &mut buf), Ok(1..)) && buf.ends_with(b"\n") {
             self.offset += buf.len() as u64;
             let line = String::from_utf8_lossy(&buf);
-            if copilot { self.copilot(&line) } else { self.claude(&line) }
+            match kind {
+                Kind::Copilot => self.copilot(&line),
+                Kind::Codex => self.codex(&line),
+                Kind::Claude => self.claude(&line),
+            }
             buf.clear();
         }
-        if !copilot {
+        if kind == Kind::Claude {
             let t: [u64; 4] =
                 std::array::from_fn(|i| self.done[i] + self.cur.as_ref().map_or(0, |(_, c, _)| c[i]));
             (self.input, self.cached, self.output) = (t[0] + t[1], t[2], t[3]);
@@ -170,6 +239,44 @@ impl Usage {
             if let Some(model) = m["model"].as_str().filter(|m| !m.starts_with('<')) {
                 self.model = model.to_string();
             }
+        }
+    }
+
+    /// A codex rollout line. `token_count` carries everything worth showing: what the last
+    /// request put in the context window, how big that window is, the running totals, and the
+    /// account's own rate-limit windows. `turn_context` names the model.
+    fn codex(&mut self, line: &str) {
+        if !["\"token_count\"", "\"turn_context\"", "\"task_started\""].iter().any(|k| line.contains(k)) {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        let p = &v["payload"];
+        if let Some(model) = p["model"].as_str() {
+            self.model = model.to_string();
+        }
+        // the start of a turn already says how big the window is, before anything is counted
+        if let Some(n) = p["model_context_window"].as_u64() {
+            self.window = n;
+        }
+        if p["type"] != "token_count" {
+            return;
+        }
+        let (info, n) = (&p["info"], |o: &Value, k: &str| o[k].as_u64().unwrap_or(0));
+        // the last request is what sits in the window now; the totals are the whole session
+        self.context = n(&info["last_token_usage"], "total_tokens");
+        self.window = n(info, "model_context_window");
+        let total = &info["total_token_usage"];
+        (self.input, self.cached) = (n(total, "input_tokens"), n(total, "cached_input_tokens"));
+        let output = n(total, "output_tokens");
+        let minute = v["timestamp"].as_str().and_then(epoch_minute).unwrap_or(0);
+        *self.timeline.entry(minute).or_default() += output.saturating_sub(self.output);
+        self.output = output;
+        let window = |k: &str| -> Option<Window> {
+            let w = &p["rate_limits"][k];
+            Some(Window { used: w["used_percent"].as_f64()?, resets_at: w["resets_at"].as_u64().unwrap_or(0) })
+        };
+        if let Some(primary) = window("primary") {
+            self.limits = Some((primary, window("secondary")));
         }
     }
 
@@ -313,7 +420,7 @@ mod tests {
         };
         let p = tmp("claude.jsonl", &(line("a", 5, 1) + &line("a", 7, 1) + &line("b", 3, 2)));
         let mut u = Usage::default();
-        u.refresh(&p, false);
+        u.refresh(&p, Kind::Claude);
         assert_eq!((u.input, u.cached, u.output, u.context), (220, 2000, 10, 1110));
         assert_eq!((u.model.as_str(), u.limit()), ("claude-opus-5", 200_000));
         let m0 = epoch_minute("2026-09-14T10:00:00Z").unwrap();
@@ -322,9 +429,50 @@ mod tests {
         // appended lines are picked up; a partial line waits for its newline
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
         write!(f, "{}{}", line("b", 9, 3), &line("c", 1, 3)[..20]).unwrap();
-        u.refresh(&p, false);
+        u.refresh(&p, Kind::Claude);
         assert_eq!(u.output, 16, "a:7 + b:9, c not complete yet");
         assert_eq!(u.timeline.get(&(m0 + 2)), Some(&9), "b's growth lands on b's first minute");
+    }
+
+    /// Lines from a real codex 0.157 rollout (`~/.codex/sessions/.../rollout-*.jsonl`), as
+    /// written when it answered one short prompt on a ChatGPT Plus plan.
+    const CODEX: &str = concat!(
+        r#"{"timestamp":"2026-09-25T03:44:32.814Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a0d6aa-3028-74a2-bfb3-cad664b92a93","root_turn_id":"01a0d6aa-3028-74a2-bfb3-cad664b92a93","started_at":1790307872,"model_context_window":258400,"collaboration_mode_kind":"default"}}"#, "\n",
+        r#"{"timestamp":"2026-09-25T03:44:34.115Z","ordinal":7,"type":"turn_context","payload":{"turn_id":"01a0d6aa-3028-74a2-bfb3-cad664b92a93","cwd":"/tmp/cwork","approval_policy":"on-request","model":"gpt-6-astra"}}"#, "\n",
+        r#"{"timestamp":"2026-09-25T03:44:36.363Z","ordinal":13,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15342,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":8,"reasoning_output_tokens":0,"total_tokens":15350},"last_token_usage":{"input_tokens":15342,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":8,"reasoning_output_tokens":0,"total_tokens":15350},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":0.0,"window_minutes":300,"resets_at":1790325874},"secondary":{"used_percent":58.0,"window_minutes":10080,"resets_at":1790385165},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"plus","rate_limit_reached_type":null}}}"#, "\n",
+    );
+
+    #[test]
+    fn codex_rollout_is_read_and_found() {
+        let dir = std::env::temp_dir().join(format!("chud-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let day = dir.join(".codex/sessions/2026/09/25");
+        std::fs::create_dir_all(&day).unwrap();
+        let sid = "01a0d6aa-2fea-7d22-85e5-7be305238510";
+        let file = day.join(format!("rollout-2026-09-25T15-44-32-{sid}.jsonl"));
+        // written a line at a time, the way codex does, so the reader picks up where it left off
+        let (first, rest) = CODEX.split_at(CODEX.find('\n').unwrap() + 1);
+        std::fs::write(&file, first).unwrap();
+        let mut u = Usage::default();
+        u.refresh(&file, Kind::Codex);
+        assert_eq!((u.window, u.context, u.limits), (258_400, 0, None), "the window is known from the turn's start");
+        std::fs::write(&file, CODEX).unwrap();
+        u.refresh(&file, Kind::Codex);
+
+        assert_eq!(u.model, "gpt-6-astra");
+        assert_eq!((u.context, u.limit()), (15_350, 258_400), "what the last request carried, of its real window");
+        assert_eq!((u.input, u.cached, u.output), (15_342, 12_032, 8));
+        let (five, week) = u.limits.unwrap();
+        assert_eq!(five, Window { used: 0.0, resets_at: 1_790_325_874 }, "the 300-minute window");
+        assert_eq!(week, Some(Window { used: 58.0, resets_at: 1_790_385_165 }), "and the week's");
+        assert_eq!(u.timeline.values().sum::<u64>(), 8, "output tokens land in the activity grid");
+
+        // found by its id, which is only in the file's name
+        std::fs::create_dir_all(dir.join(".codex/sessions/2026/09/24")).unwrap();
+        assert_eq!(codex_rollouts(&dir.join(".codex")), [file.clone()]);
+        let found = codex_rollouts(&dir.join(".codex")).into_iter().find(|p| p.to_string_lossy().ends_with(&format!("-{sid}.jsonl")));
+        assert_eq!(found.as_deref(), Some(file.as_path()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -340,7 +488,7 @@ mod tests {
             ),
         );
         let mut u = Usage::default();
-        u.refresh(&p, true);
+        u.refresh(&p, Kind::Copilot);
         assert_eq!((u.output, u.context, u.premium, u.model.as_str()), (500, 228076, 1, "gpt-5.6-terra"));
         assert_eq!(u.limit(), 272_000, "the prompt limit, not the full window");
         assert!((u.credits - 135.47169).abs() < 1e-6);
@@ -356,9 +504,9 @@ mod tests {
         assert_eq!(claude("claude-sonnet-5[1m]").limit(), 1_000_000, "opted into the long window");
         let reported = Usage { window: 1_000_000, model: "claude-opus-5".into(), ..Default::default() };
         assert_eq!(reported.limit(), 1_000_000, "what claude code reports wins over the guess");
-        let copilot = Usage { copilot: true, prompt_limit: 272_000, ..Default::default() };
+        let copilot = Usage { kind: Kind::Copilot, prompt_limit: 272_000, ..Default::default() };
         assert_eq!(copilot.limit(), 272_000, "copilot logs max_prompt_tokens");
-        assert_eq!(Usage { copilot: true, ..Default::default() }.limit(), 128_000, "before it logs one");
+        assert_eq!(Usage { kind: Kind::Copilot, ..Default::default() }.limit(), 128_000, "before it logs one");
     }
 
     #[test]
@@ -385,10 +533,10 @@ mod tests {
     #[test]
     fn paths() {
         let home = std::env::var("HOME").unwrap();
-        let claude = log_path(false, "abc", Path::new("/Users/me/Projects/chud")).unwrap();
+        let claude = log_path(Kind::Claude, "abc", Path::new("/Users/me/Projects/chud")).unwrap();
         assert_eq!(claude, Path::new(&home).join(".claude/projects/-Users-me-Projects-chud/abc.jsonl"));
-        let copilot = log_path(true, "abc", Path::new("/x")).unwrap();
+        let copilot = log_path(Kind::Copilot, "abc", Path::new("/x")).unwrap();
         assert_eq!(copilot, Path::new(&home).join(".copilot/session-state/abc/events.jsonl"));
-        assert_eq!(log_path(false, "", Path::new("/x")), None);
+        assert_eq!(log_path(Kind::Claude, "", Path::new("/x")), None);
     }
 }

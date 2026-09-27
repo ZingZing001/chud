@@ -64,6 +64,7 @@ fn icon(agent: &Agent) -> Span<'static> {
     match agent {
         Agent::Claude => Span::styled(pick("\u{ec82} ", "✳ "), pal().claude),
         Agent::Copilot => Span::styled(pick("\u{ec1e} ", "◆ "), pal().copilot),
+        Agent::Codex => Span::styled("◈ ", pal().codex), // no codex glyph in the icon fonts
         Agent::Profile(i) => Span::styled(format!("{} ", crate::agents::all()[*i].icon), crate::agents::all()[*i].color),
         Agent::Shell => pick("\u{e795} ", "❯ ").gray(),
         Agent::Other(_) => pick("\u{e795} ", "❯ ").dark_gray(),
@@ -74,14 +75,15 @@ fn agent_color(agent: &Agent) -> Color {
     match agent {
         Agent::Claude => pal().claude,
         Agent::Copilot => pal().copilot,
+        Agent::Codex => pal().codex,
         Agent::Profile(i) => crate::agents::all()[*i].color,
         _ => Color::Gray,
     }
 }
 
-/// Context and usage come from these two agents' logs, which have known formats.
+/// Context and usage come from these agents' logs, which have known formats.
 fn has_usage(s: &Session) -> bool {
-    matches!(s.agent, Agent::Claude | Agent::Copilot)
+    matches!(s.agent, Agent::Claude | Agent::Copilot | Agent::Codex)
 }
 
 fn elapsed(d: Duration) -> String {
@@ -400,29 +402,43 @@ fn session_header(f: &mut Frame, s: &Session, i: usize, plan: &Plan, area: Rect,
     let lead = || if focused { "▌".fg(pal().accent) } else { Span::raw(" ") };
     let mut spans = vec![lead(), icon(&s.agent)];
     match &s.agent {
-        Agent::Claude | Agent::Copilot => {
-            let claude = s.agent == Agent::Claude;
+        Agent::Claude | Agent::Copilot | Agent::Codex => {
+            let name = match s.agent {
+                Agent::Claude => "claude",
+                Agent::Copilot => "copilot",
+                _ => "codex",
+            };
             let model = if s.usage.model.is_empty() { String::new() } else { format!(" · {}", s.usage.model) };
-            spans.push(format!("{}{model}   ", if claude { "claude" } else { "copilot" }).bold());
+            spans.push(format!("{name}{model}   ").bold());
             let bar = |w: Window| chud::bar(w.used / 100.0, (area.width / 5).clamp(10, 30) as usize);
-            match (claude, plan.five_hour, plan.copilot) {
-                (true, Some(h), _) => {
-                    spans.push(Span::raw("5h limit "));
-                    spans.extend(bar(h));
-                    spans.push(format!(" {:.0}%", h.used).into());
-                    spans.push(format!("  resets in {}", until(h.resets_at)).fg(pal().dim));
-                    if let Some(w) = plan.seven_day {
-                        spans.push(format!(" · week {:.0}%", w.used).fg(pal().dim));
-                    }
-                }
-                (false, _, Some((q, total))) => {
+            // past its reset a window starts empty again, until the agent reports the new one
+            let fresh = |w: Window| if w.resets_at > 0 && now_secs() >= w.resets_at { Window { used: 0.0, ..w } } else { w };
+            // Claude's windows come from its status line, for the whole plan; Codex writes its own
+            // into every session's log; Copilot has a monthly request quota instead
+            let windows = match s.agent {
+                Agent::Claude => plan.five_hour.map(|h| (h, plan.seven_day)),
+                Agent::Codex => s.usage.limits.map(|(h, w)| (fresh(h), w.map(fresh))),
+                _ => None,
+            };
+            match (&s.agent, windows, plan.copilot) {
+                (Agent::Copilot, _, Some((q, total))) => {
                     spans.push(Span::raw("premium requests "));
                     spans.extend(bar(q));
                     spans.push(format!(" {:.0}% of {total}", q.used).into());
                     spans.push(format!("  resets in {}", until(q.resets_at)).fg(pal().dim));
                 }
-                (true, None, _) => spans.push("5h limit shows after Claude's next reply".fg(pal().dim)),
-                (false, _, None) => spans.push("premium requests: checking with GitHub…".fg(pal().dim)),
+                (Agent::Copilot, _, None) => spans.push("premium requests: checking with GitHub…".fg(pal().dim)),
+                (_, Some((h, week)), _) => {
+                    spans.push(Span::raw("5h limit "));
+                    spans.extend(bar(h));
+                    spans.push(format!(" {:.0}%", h.used).into());
+                    spans.push(format!("  resets in {}", until(h.resets_at)).fg(pal().dim));
+                    if let Some(w) = week {
+                        spans.push(format!(" · week {:.0}%", w.used).fg(pal().dim));
+                    }
+                }
+                (Agent::Codex, None, _) => spans.push("5h limit shows after Codex's first reply".fg(pal().dim)),
+                _ => spans.push("5h limit shows after Claude's next reply".fg(pal().dim)),
             }
         }
         Agent::Profile(_) | Agent::Shell | Agent::Other(_) => {
@@ -443,9 +459,14 @@ fn session_header(f: &mut Frame, s: &Session, i: usize, plan: &Plan, area: Rect,
     // at header size, as fat as the context it has eaten, running while the agent compacts.
     let used = fullness(s);
     let mut below = vec![lead(), Span::raw("  "), "context ".fg(pal().dim)];
-    below.extend(chud::bar(used, (area.width / 6).clamp(8, 20) as usize));
-    below.push(format!(" {:.0}%", used * 100.0).into());
-    below.push(format!("  {} of {}", tokens(s.usage.context), tokens(s.usage.limit())).fg(pal().dim));
+    if s.agent == Agent::Codex && s.usage.window == 0 {
+        // codex names its window only once a turn starts; any number before that is a guess
+        below.push("shows after Codex's first reply".fg(pal().dim));
+    } else {
+        below.extend(chud::bar(used, (area.width / 6).clamp(8, 20) as usize));
+        below.push(format!(" {:.0}%", used * 100.0).into());
+        below.push(format!("  {} of {}", tokens(s.usage.context), tokens(s.usage.limit())).fg(pal().dim));
+    }
     if s.compacting() {
         below.push("  compacting…".fg(pal().accent));
     }

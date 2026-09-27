@@ -29,7 +29,6 @@ fn builtin(name: &str, icon: &str, color: Color) -> Profile {
 
 pub fn builtins() -> Vec<Profile> {
     vec![
-        builtin("codex", "◈", Color::Rgb(0x10, 0xa3, 0x7f)),
         builtin("gemini", "✦", Color::Rgb(0x42, 0x85, 0xf4)),
         builtin("aider", "◇", Color::Rgb(0xe5, 0xc0, 0x7b)),
         builtin("opencode", "◎", Color::Rgb(0x7a, 0xa2, 0xf7)),
@@ -139,15 +138,15 @@ mod tests {
     #[test]
     fn config_adds_and_overrides() {
         let cfg = json!({ "agents": [
-            { "name": "codex", "icon": "C", "color": "#112233" },
+            { "name": "gemini", "icon": "G", "color": "#112233" },
             { "name": "mine", "match": ["my-harness", "mh"], "status": "none", "env": { "FOO": "bar" } },
             { "name": "sloppy", "color": "not a colour", "match": [] },
             { "icon": "no name, skipped" },
         ]});
         let all = from_config(&cfg);
         let get = |n: &str| all.iter().find(|p| p.name == n).cloned().unwrap();
-        assert_eq!(all.iter().filter(|p| p.name == "codex").count(), 1, "replaced, not duplicated");
-        assert_eq!((get("codex").icon.as_str(), get("codex").color), ("C", Color::Rgb(0x11, 0x22, 0x33)));
+        assert_eq!(all.iter().filter(|p| p.name == "gemini").count(), 1, "replaced, not duplicated");
+        assert_eq!((get("gemini").icon.as_str(), get("gemini").color), ("G", Color::Rgb(0x11, 0x22, 0x33)));
         assert_eq!(get("mine").matches, ["my-harness", "mh"]);
         assert!(!get("mine").infer_status);
         assert_eq!(get("mine").env, [("FOO".to_string(), "bar".to_string())]);

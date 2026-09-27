@@ -12,12 +12,12 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 
 | | |
 |---|---|
-| **Live agent status** | Working, needs input, done, or exited, for Claude Code and Copilot CLI. It also picks up agents you start by hand inside a shell session. |
+| **Live agent status** | Working, needs input, done, or exited, for Claude Code, Copilot CLI and Codex CLI. It also picks up agents you start by hand inside a shell session. |
 | **Notifications & unread markers** | A macOS notification when an agent finishes or asks for input; a marker on sessions you haven't looked at since. |
 | **Split panes** | Watch several agents at once: drag a session out of the sidebar onto a pane to open it beside, above or below. Drag dividers to resize; the layout survives a restart. |
-| **Any agent** | Codex, Gemini CLI, aider, opencode and amp out of the box; add your own harness in `config.json`. |
+| **Any agent** | Gemini CLI, aider, opencode and amp out of the box too; add your own harness in `config.json`. |
 | **Light and dark** | Follows the system theme, live in chud.app. |
-| **Plan usage header** | Claude's rolling 5-hour limit with a reset countdown plus the weekly %, or Copilot's monthly premium requests. |
+| **Plan usage header** | Claude's or Codex's rolling 5-hour limit with a reset countdown plus the weekly %, or Copilot's monthly premium requests. |
 | **Context fullness** | Per-session bar in the sidebar showing how full each agent's context window is. |
 | **Groups** | Put sessions in named, foldable groups; drag sessions to reorder or regroup them. |
 | **Dashboard** | Summary page with token charts, working time, and every agent's chud. |
@@ -70,7 +70,9 @@ Run `chud --setup` to go through it again. Your choices live in `~/.config/chud/
 
 ### 3. Other agents (optional)
 
-Codex, Gemini CLI, aider, opencode and amp are recognised out of the box. They get an icon, a colour, a chud and a status. For any other agent or your own harness, add it to `config.json`:
+Codex gets everything Claude and Copilot do — status, the context bar, its plan's 5-hour and weekly limits, and a restart reopening the same chat — read from its own session files, so there is nothing to set up. It honours `$CODEX_HOME`.
+
+Gemini CLI, aider, opencode and amp are recognised out of the box. They get an icon, a colour, a chud and a status. For any other agent or your own harness, add it to `config.json`:
 
 ```json
 {

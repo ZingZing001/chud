@@ -306,9 +306,39 @@ fn resume_argv(argv: &[String], sid: &str, saved: bool) -> Vec<String> {
 /// digits and dashes, since it lands in a command line.
 fn resume_in_shell(argv: &[String], agent: &str, sid: &str) -> Option<Vec<String>> {
     let shell = argv.first().filter(|p| session::agent_of(p) == Agent::Shell && !cfg!(windows))?;
+    let words = resume_words(agent, sid)?;
+    Some(vec![shell.clone(), "-ic".into(), format!("{}; exec {shell}", words.join(" "))])
+}
+
+/// How each agent reopens a chat: claude and copilot take a flag, codex a subcommand. None for
+/// anything else, or an id that isn't only letters, digits and dashes — it lands in a command.
+fn resume_words(agent: &str, sid: &str) -> Option<Vec<String>> {
     let safe = !sid.is_empty() && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    let agent = ["claude", "copilot"].into_iter().find(|a| *a == agent)?;
-    safe.then(|| vec![shell.clone(), "-ic".into(), format!("{agent} --resume {sid}; exec {shell}")])
+    let how = match agent {
+        "claude" | "copilot" => "--resume",
+        "codex" => "resume",
+        _ => return None,
+    };
+    safe.then(|| vec![agent.to_string(), how.to_string(), sid.to_string()])
+}
+
+/// The name an agent's chats are saved under, for the agents chud can reopen.
+fn agent_name(agent: &Agent) -> Option<&'static str> {
+    match agent {
+        Agent::Claude => Some("claude"),
+        Agent::Copilot => Some("copilot"),
+        Agent::Codex => Some("codex"),
+        _ => None,
+    }
+}
+
+/// Which log format an agent name's chats are kept in.
+fn kind_of(agent: &str) -> usage::Kind {
+    match agent {
+        "copilot" => usage::Kind::Copilot,
+        "codex" => usage::Kind::Codex,
+        _ => usage::Kind::Claude,
+    }
 }
 
 fn state_path() -> PathBuf {
@@ -1276,7 +1306,7 @@ impl App {
             .map(|s| {
                 // an agent typed into a shell: the chat it has open, so a restart reopens it
                 let resume = s.resume.as_ref().filter(|(agent, ..)| *agent == s.agent).map(|(agent, sid, cwd)| {
-                    json!({ "agent": if *agent == Agent::Copilot { "copilot" } else { "claude" }, "sid": sid, "cwd": cwd })
+                    json!({ "agent": agent_name(agent).unwrap_or("claude"), "sid": sid, "cwd": cwd })
                 });
                 json!({ "argv": s.argv, "cwd": s.cwd, "name": s.name, "group": s.group,
                         "sid": s.agent_sid(), "worked": s.worked().as_secs(), "resume": resume })
@@ -1315,8 +1345,8 @@ impl App {
             let (Some(prog), Some(cwd)) = (argv.first(), s["cwd"].as_str()) else { continue };
             let cwd = PathBuf::from(cwd);
             let sid = s["sid"].as_str().unwrap_or_default();
-            let copilot = session::agent_of(prog) == Agent::Copilot;
-            let saved = usage::log_path(copilot, sid, &cwd).is_some_and(|p| p.exists());
+            let kind = if session::agent_of(prog) == Agent::Copilot { usage::Kind::Copilot } else { usage::Kind::Claude };
+            let saved = usage::log_path(kind, sid, &cwd).is_some_and(|p| p.exists());
             let mut run = resume_argv(&argv, sid, saved);
             let mut cwd = cwd;
             // a terminal you ran claude or copilot in comes back running that chat again, in
@@ -1330,8 +1360,20 @@ impl App {
             };
             let r = old.as_ref().unwrap_or(&s["resume"]);
             if let (Some(agent), Some(rsid), Some(rcwd)) = (r["agent"].as_str(), r["sid"].as_str(), r["cwd"].as_str()) {
-                let on_disk = usage::log_path(agent == "copilot", rsid, Path::new(rcwd)).is_some_and(|p| p.exists());
-                if let Some(argv) = resume_in_shell(&argv, agent, rsid).filter(|_| on_disk) {
+                let on_disk = usage::log_path(kind_of(agent), rsid, Path::new(rcwd)).is_some_and(|p| p.exists());
+                // a terminal gets the chat back inside its shell; a session that *was* the agent
+                // (codex, whose id chud only learns afterwards) is started as that chat directly
+                let again = match session::agent_of(prog) {
+                    Agent::Shell => resume_in_shell(&argv, agent, rsid),
+                    started if agent_name(&started) == Some(agent) => {
+                        resume_words(agent, rsid).map(|mut w| {
+                            w[0] = prog.clone(); // keep how it was started: a full path, say
+                            w
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(argv) = again.filter(|_| on_disk) {
                     (run, cwd) = (argv, PathBuf::from(rcwd));
                 }
             }
@@ -2014,7 +2056,14 @@ mod tests {
         assert_eq!(resume_in_shell(&["claude".to_string()], "claude", id), None, "agents resume their own way");
         assert_eq!(resume_in_shell(&zsh, "claude", "x; rm -rf ~"), None, "the id lands in a command line");
         assert_eq!(resume_in_shell(&zsh, "claude", ""), None);
-        assert_eq!(resume_in_shell(&zsh, "sh -c evil", id), None, "only the two agents we know");
+        assert_eq!(resume_in_shell(&zsh, "sh -c evil", id), None, "only the agents we know");
+        // codex reopens a chat with a subcommand, not a flag
+        assert_eq!(
+            resume_in_shell(&zsh, "codex", id),
+            Some(vec!["zsh".into(), "-ic".into(), format!("codex resume {id}; exec zsh")])
+        );
+        assert_eq!(resume_words("codex", id), Some(vec!["codex".into(), "resume".into(), id.into()]));
+        assert_eq!(resume_words("claude", id), Some(vec!["claude".into(), "--resume".into(), id.into()]));
     }
 
     #[test]

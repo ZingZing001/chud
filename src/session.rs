@@ -33,6 +33,7 @@ pub enum Event {
 pub enum Agent {
     Claude,
     Copilot,
+    Codex,
     /// one of `agents::all()`: a built-in like Codex, or one from config.json
     Profile(usize),
     Shell,
@@ -51,6 +52,7 @@ fn agent_in(path: &str, profiles: &[agents::Profile]) -> Agent {
         "claude" => Agent::Claude,
         _ if path.contains("/claude/versions/") => Agent::Claude, // native install: .../claude/versions/2.1.270
         "copilot" => Agent::Copilot,
+        "codex" => Agent::Codex,
         "zsh" | "bash" | "fish" | "sh" | "dash" | "nu" | "powershell" | "pwsh" | "cmd" => Agent::Shell,
         _ => match profiles.iter().position(|p| p.matches.iter().any(|m| m == name)) {
             Some(i) => Agent::Profile(i),
@@ -65,7 +67,7 @@ fn agent_in_cmdline(args: &str, profiles: &[agents::Profile]) -> Option<Agent> {
     args.split_whitespace()
         .skip(1)
         .map(|word| agent_in(word, profiles))
-        .find(|a| matches!(a, Agent::Claude | Agent::Copilot | Agent::Profile(_)))
+        .find(|a| matches!(a, Agent::Claude | Agent::Copilot | Agent::Codex | Agent::Profile(_)))
 }
 
 /// A chat title from the terminal title: drops Claude's spinner glyphs, Copilot's suffix and
@@ -74,6 +76,45 @@ pub fn chat_name(title: &str) -> Option<String> {
     let t = title.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
     let t = t.strip_suffix(" - GitHub Copilot").unwrap_or(t).trim();
     (!matches!(t, "" | "Claude Code" | "GitHub Copilot")).then(|| t.to_string())
+}
+
+/// Codex says what it is doing in the window title — no escape sequences, no bell, just the
+/// title: a braille spinner in front while it works (`⠋ Fix the tests | repo`), a blinking
+/// `[ ! ] Action Required | …` while it waits for your approval, and neither once it is done.
+pub fn codex_status(title: &str, now: Status) -> Status {
+    let spinning = title.chars().next().is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c));
+    match now {
+        _ if title.contains("Action Required") => Status::NeedsInput,
+        _ if spinning => Status::Working,
+        // it stopped: whatever it was doing, or asking, is over
+        Status::Working | Status::NeedsInput => Status::Done,
+        _ => now,
+    }
+}
+
+/// The chat a codex command line resumes, as `ps` shows it: `node /opt/homebrew/bin/codex
+/// resume <id>`, where the npm shim puts node in front.
+fn codex_resume_id(args: &str) -> Option<String> {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let at = words.iter().position(|w| w.rsplit(['/', '\\']).next() == Some("codex"))?;
+    if words.get(at + 1) != Some(&"resume") {
+        return None;
+    }
+    words.get(at + 2).filter(|w| !w.starts_with('-')).map(|w| w.to_string())
+}
+
+/// The chat's name out of a codex title: `[ ! ] Action Required | Run the tests | repo` and
+/// `⠋ Run the tests | repo` are both "Run the tests". The last part is the folder, which the
+/// sidebar already shows, and a title with only a folder in it names no chat yet.
+pub fn codex_chat(title: &str) -> String {
+    let mut parts: Vec<&str> =
+        title.split(" | ").map(str::trim).filter(|p| !p.is_empty() && !p.ends_with("Action Required")).collect();
+    if parts.len() > 1 {
+        parts.pop(); // the folder
+    } else {
+        return String::new();
+    }
+    parts.join(" | ")
 }
 
 /// vt100 callbacks: turns the agent's escape sequences into status, chat name and ids.
@@ -214,6 +255,8 @@ pub struct Session {
     /// the process in front (the agent, when one runs), and the Copilot session found for it
     fg_pid: Option<i32>,
     found: Option<String>,
+    /// when that process came to the front
+    fg_since: std::time::SystemTime,
     /// the agent in front and the chat it has on disk (id, folder), so a restart can resume it
     /// even when it was typed into a shell rather than started by chud
     pub resume: Option<(Agent, String, PathBuf)>,
@@ -221,6 +264,9 @@ pub struct Session {
     fg_script: Option<Agent>,
     /// when you last petted it, for the few seconds it looks pleased about it
     petted: Option<Instant>,
+    /// you have given the agent in front something to do since it started. Codex spins its
+    /// title while it boots, too; until you have asked it anything, that is not a turn
+    asked: bool,
     /// the agent is folding the conversation down to fit; checked from the screen, not often
     compacting: bool,
     compact_checked: Instant,
@@ -239,6 +285,8 @@ impl Session {
         tx: Sender<Event>,
     ) -> Result<Self> {
         let agent = agent_of(&argv[0]);
+        // a prompt on the command line (`codex "fix it"`) starts a turn by itself
+        let asked = argv.len() > 1 && argv[1] != "resume";
         // Pick the agent's session id ourselves so we can find its log and resume it later.
         let mut run = argv.clone();
         let mut sid = resumed_id(&argv).unwrap_or_default();
@@ -329,9 +377,11 @@ impl Session {
             probed: Instant::now(),
             fg_pid: None,
             found: None,
+            fg_since: std::time::SystemTime::now(),
             resume: None,
             fg_script: None,
             petted: None,
+            asked,
             compacting: false,
             compact_checked: Instant::now(),
             activity: Activity::default(),
@@ -357,6 +407,7 @@ impl Session {
 
     /// Enter was sent to this session: the start of a possible stretch of work.
     pub fn submit(&mut self) {
+        self.asked = true;
         if self.infers_status() {
             self.activity.submit(Instant::now());
         }
@@ -365,6 +416,18 @@ impl Session {
     /// The program printed something. For an agent that reports nothing itself, that may mean
     /// it started working.
     pub fn on_output(&mut self) {
+        if self.agent == Agent::Codex && self.exit.is_none() {
+            let parser = self.parser.clone();
+            let mut p = parser.lock().unwrap();
+            let signals = p.callbacks_mut();
+            let next = codex_status(&signals.title, signals.status);
+            // before you have asked it anything its spinner is codex starting up, and treating
+            // that as a turn would call every restored codex "done" before it had done anything
+            if self.asked || next == Status::NeedsInput {
+                signals.status = next;
+            }
+            return;
+        }
         self.guess(|a, now, st| a.output(now, st));
     }
 
@@ -444,6 +507,7 @@ impl Session {
             return name.clone();
         }
         let chat = self.parser.lock().unwrap().callbacks().chat.clone();
+        let chat = if self.agent == Agent::Codex { codex_chat(&chat) } else { chat };
         if chat.is_empty() { self.folder() } else { chat }
     }
 
@@ -478,7 +542,7 @@ impl Session {
         let Some(pid) = self.foreground_pid() else { return false };
         let Some(mut agent) = proc_path(pid).map(|p| agent_of(&p)) else { return false };
         if self.fg_pid != Some(pid) {
-            (self.fg_pid, self.found) = (Some(pid), None);
+            (self.fg_pid, self.found, self.fg_since) = (Some(pid), None, std::time::SystemTime::now());
             // A shell or an interpreter may be running an agent: a custom harness is often a
             // script, and Gemini CLI is Node. The command line says which; it is read once per
             // process, not on every burst of output.
@@ -497,6 +561,7 @@ impl Session {
         }
         self.agent = agent;
         self.resume = None; // that agent is gone; the next one is found by refresh_usage
+        self.asked = false; // the Enter that started it was not a question for it
         let mut p = self.parser.lock().unwrap();
         let s = p.callbacks_mut();
         s.chat.clear(); // a different program: the old chat name and summary no longer apply
@@ -508,6 +573,7 @@ impl Session {
         let copilot = match self.agent {
             Agent::Copilot => true,
             Agent::Claude => false,
+            Agent::Codex => return self.refresh_codex(),
             _ => return,
         };
         // the running agent's own session, found by its pid: this also covers an agent
@@ -530,8 +596,9 @@ impl Session {
         let cwd = found_cwd
             .or_else(|| Some(PathBuf::from(&agent_cwd)).filter(|_| !agent_cwd.is_empty()))
             .unwrap_or_else(|| self.cwd.clone());
-        if let Some(path) = usage::log_path(copilot, &sid, &cwd) {
-            self.usage.refresh(&path, copilot);
+        let kind = if copilot { usage::Kind::Copilot } else { usage::Kind::Claude };
+        if let Some(path) = usage::log_path(kind, &sid, &cwd) {
+            self.usage.refresh(&path, kind);
             if path.exists() {
                 self.resume = Some((self.agent.clone(), sid.clone(), cwd.clone()));
             }
@@ -573,6 +640,38 @@ impl Session {
         std::mem::replace(&mut self.compacting, now) != now
     }
 
+    /// Codex chooses its own session id and writes no marker chud could match by pid, so its
+    /// rollout is found by folder: the newest one there written since this codex came to the
+    /// front. Once found it is kept, until a different program takes the front.
+    fn refresh_codex(&mut self) {
+        // Where it runs and which chat it is are settled once per codex: asking the system for
+        // the folder is a process spawn, and the search reads the whole sessions tree
+        if self.found.is_none() || self.resume.is_none() {
+            let cwd = self.fg_pid.and_then(proc_cwd).unwrap_or_else(|| self.cwd.clone());
+            if self.found.is_none() {
+                // A resumed chat names itself — on chud's own command line, or on the one a
+                // shell ran — and needs no search: it has not written anything since it
+                // started, so the search would pass it over. Only a fresh chat is looked up.
+                let named = resumed_id(&self.argv)
+                    .or_else(|| Some(self.sid.clone()).filter(|s| !s.is_empty()))
+                    .or_else(|| self.fg_pid.and_then(proc_args).and_then(|a| codex_resume_id(&a)));
+                self.found = named.or_else(|| usage::codex_session(&usage::codex_home(), &cwd, self.fg_since));
+            }
+            if let Some(sid) = &self.found {
+                if usage::log_path(usage::Kind::Codex, sid, &cwd).is_some() {
+                    self.resume = Some((Agent::Codex, sid.clone(), cwd));
+                }
+            }
+        }
+        let Some(sid) = self.found.clone() else { return };
+        // the file it is already reading, if that is this chat's; otherwise find it by its id
+        let known = self.usage.path().to_string_lossy().ends_with(&format!("-{sid}.jsonl"));
+        let path = if known { Some(self.usage.path().to_path_buf()) } else { usage::log_path(usage::Kind::Codex, &sid, &self.cwd) };
+        if let Some(path) = path {
+            self.usage.refresh(&path, usage::Kind::Codex);
+        }
+    }
+
     pub fn reap(&mut self) {
         self.exit = Some(self.child.wait().map(|s| s.exit_code()).unwrap_or(1));
     }
@@ -609,6 +708,7 @@ fn find_sid(home: &Path, agent: &Agent, pid: i32) -> Option<(String, Option<Path
 fn resumed_id(argv: &[String]) -> Option<String> {
     argv.iter().enumerate().find_map(|(i, a)| match a.as_str() {
         "--session-id" | "--resume" | "-r" => argv.get(i + 1).filter(|v| !v.starts_with('-')).cloned(),
+        "resume" if i == 1 => argv.get(2).filter(|v| !v.starts_with('-')).cloned(), // codex resume <id>
         _ => a.strip_prefix("--resume=").or(a.strip_prefix("--session-id=")).map(String::from),
     })
 }
@@ -635,6 +735,19 @@ fn uuid() -> String {
 fn proc_args(pid: i32) -> Option<String> {
     let out = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|a| !a.is_empty())
+}
+
+/// Where a process is running. Codex files its sessions by folder, and a codex typed into a
+/// shell is often somewhere other than where the session began.
+#[cfg(target_os = "macos")]
+fn proc_cwd(pid: i32) -> Option<PathBuf> {
+    let out = std::process::Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix('n')).map(PathBuf::from)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn proc_cwd(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -755,7 +868,7 @@ mod tests {
 
         let profiles = agents::from_config(&serde_json::json!({ "agents": [{ "name": "mine", "match": ["mh"] }] }));
         let index = |n: &str| Agent::Profile(profiles.iter().position(|p| p.name == n).unwrap());
-        assert_eq!(agent_in("/opt/homebrew/bin/codex", &profiles), index("codex"));
+        assert_eq!(agent_in("/opt/homebrew/bin/codex", &profiles), Agent::Codex, "a first-class agent now");
         assert_eq!(agent_in("/usr/local/bin/mh", &profiles), index("mine"), "a harness from config.json");
         assert_eq!(agent_in("/Users/me/.local/share/claude/versions/2.1.270", &profiles), Agent::Claude);
         assert_eq!(agent_in("/opt/homebrew/bin/node", &profiles), Agent::Other("node".into()));
@@ -763,8 +876,45 @@ mod tests {
         assert_eq!(cmdline("node /opt/homebrew/bin/gemini --yolo"), Some(index("gemini")), "a Node agent");
         assert_eq!(cmdline("python3 -m aider --model x"), Some(index("aider")), "a Python agent");
         assert_eq!(cmdline("node /usr/lib/node_modules/vite/bin/vite.js"), None, "node running something else");
-        assert_eq!(agent_in(r"C:\Users\me\AppData\Local\codex\codex.exe", &profiles), index("codex"), "Windows paths");
+        assert_eq!(agent_in(r"C:\Users\me\AppData\Local\codex\codex.exe", &profiles), Agent::Codex, "Windows paths");
+        // what an npm-installed codex actually is in front: node, running the PATH shim
+        assert_eq!(cmdline("node /opt/homebrew/bin/codex"), Some(Agent::Codex));
         assert_eq!(agent_in(r"C:\Program Files\PowerShell\7\pwsh.exe", &profiles), Agent::Shell);
+    }
+
+    /// The titles a real codex 0.157 set, in the order it set them, while running a command
+    /// that needed approval: working, asking, working again, done.
+    #[test]
+    fn codex_says_what_it_is_doing_in_its_title() {
+        let mut st = Status::Idle;
+        let mut seen = vec![];
+        for title in [
+            "cwork",
+            "⠋ cwork",
+            "⠹ Run touch command | cwork",
+            "[ ! ] Action Required | Run touch command | cwork",
+            "[ . ] Action Required | Run touch command | cwork",
+            "⠸ Run touch command | cwork",
+            "Run touch command | cwork",
+            "Run touch command | cwork",
+        ] {
+            st = codex_status(title, st);
+            seen.push(st);
+        }
+        use Status::*;
+        assert_eq!(seen, [Idle, Working, Working, NeedsInput, NeedsInput, Working, Done, Done]);
+        assert_eq!(codex_status("repo", Done), Done, "an idle title leaves done alone");
+
+        assert_eq!(codex_chat("Action Required | Run touch command | cwork"), "Run touch command");
+        assert_eq!(codex_chat("Run touch command | cwork"), "Run touch command");
+        assert_eq!(codex_chat("cwork"), "", "only the folder: no chat to name yet");
+        assert_eq!(codex_chat("a | b | repo"), "a | b", "a | in the chat's own name survives");
+
+        let id = "01a0e0bf-b458-7db2-a3a5-5b9a389f3e38";
+        assert_eq!(codex_resume_id(&format!("node /opt/homebrew/bin/codex resume {id}")).as_deref(), Some(id));
+        assert_eq!(codex_resume_id(&format!("codex resume {id}")).as_deref(), Some(id));
+        assert_eq!(codex_resume_id("node /opt/homebrew/bin/codex"), None, "a fresh chat");
+        assert_eq!(codex_resume_id("node /opt/homebrew/bin/codex resume --last"), None, "no id to go on");
     }
 
     #[test]
@@ -774,6 +924,8 @@ mod tests {
         assert_ne!(u, uuid());
         let v = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
         assert_eq!(resumed_id(&v("claude --resume abc")).as_deref(), Some("abc"));
+        assert_eq!(resumed_id(&v("codex resume 01a0d6aa-2fea")).as_deref(), Some("01a0d6aa-2fea"), "codex's subcommand");
+        assert_eq!(resumed_id(&v("claude fix resume")), None, "only in the subcommand's place");
         assert_eq!(resumed_id(&v("copilot --resume=abc")).as_deref(), Some("abc"));
         assert_eq!(resumed_id(&v("claude --model opus")), None);
         assert!(continues(&v("claude -c")) && !continues(&v("claude --model opus")));

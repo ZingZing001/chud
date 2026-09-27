@@ -24,6 +24,7 @@ pub struct Palette {
     pub heat_high: (u8, u8, u8),
     pub claude: Color,
     pub copilot: Color,
+    pub codex: Color,
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -45,6 +46,7 @@ pub const DARK: Palette = Palette {
     heat_high: (0xff, 0xc2, 0x7a),
     claude: rgb(0xd9, 0x77, 0x57),
     copilot: rgb(0xa3, 0x71, 0xf7),
+    codex: rgb(0x10, 0xa3, 0x7f),
 };
 
 /// Same roles, darker inks: an accent that holds up as a border on white, secondary text that
@@ -64,6 +66,7 @@ pub const LIGHT: Palette = Palette {
     heat_high: (0xd9, 0x72, 0x1c),
     claude: rgb(0xc1, 0x5f, 0x3c),
     copilot: rgb(0x82, 0x50, 0xd8),
+    codex: rgb(0x0c, 0x7d, 0x61),
 };
 
 // An atomic rather than a OnceLock: the theme can change while chud runs (the system flips to
