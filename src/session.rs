@@ -271,7 +271,8 @@ pub struct Session {
     compacting: bool,
     compact_checked: Instant,
     activity: Activity,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// bytes for the program, written by the session's own writer thread (see `spawn`)
+    writer: Sender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -333,7 +334,21 @@ impl Session {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        // Writing to a terminal blocks once its program stops reading and the kernel's input
+        // buffer (about 1 KB) is full. Done on chud's main thread, that froze the whole app; and
+        // since the reader below needs to write too, to answer the program's queries, it could
+        // deadlock for good: chud stops draining the program's output, the program blocks
+        // writing it and never reads again. So every write goes through this session's own
+        // thread, and a program that is not reading can only ever stall itself.
+        let (writer, queue) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut pty_in = pair.master.take_writer()?;
+        std::thread::spawn(move || {
+            for bytes in queue {
+                if pty_in.write_all(&bytes).and_then(|_| pty_in.flush()).is_err() {
+                    return; // the program is gone
+                }
+            }
+        });
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
@@ -350,7 +365,7 @@ impl Session {
                     std::mem::take(&mut p.callbacks_mut().reply)
                 };
                 if !reply.is_empty() {
-                    let _ = w.lock().unwrap().write_all(&reply);
+                    let _ = w.send(reply);
                 }
                 if tx.send(Event::Output(id)).is_err() {
                     return;
@@ -460,7 +475,7 @@ impl Session {
     }
 
     pub fn write(&self, bytes: &[u8]) {
-        let _ = self.writer.lock().unwrap().write_all(bytes);
+        let _ = self.writer.send(bytes.to_vec());
     }
 
     pub fn paste(&self, text: &str) {
@@ -738,11 +753,21 @@ fn proc_args(pid: i32) -> Option<String> {
 }
 
 /// Where a process is running. Codex files its sessions by folder, and a codex typed into a
-/// shell is often somewhere other than where the session began.
+/// shell is often somewhere other than where the session began. Asked of the kernel directly:
+/// `lsof` would do it, but on a Mac with endpoint security it can hang for minutes, and this
+/// runs on chud's main thread.
 #[cfg(target_os = "macos")]
 fn proc_cwd(pid: i32) -> Option<PathBuf> {
-    let out = std::process::Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]).output().ok()?;
-    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix('n')).map(PathBuf::from)
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: `info` is a valid, writable buffer of exactly `size` bytes.
+    let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, (&mut info as *mut libc::proc_vnodepathinfo).cast(), size) };
+    if n != size {
+        return None;
+    }
+    // SAFETY: the kernel fills vip_path with a NUL-terminated path.
+    let path = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    Some(PathBuf::from(path.to_string_lossy().into_owned())).filter(|p| !p.as_os_str().is_empty())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -915,6 +940,15 @@ mod tests {
         assert_eq!(codex_resume_id(&format!("codex resume {id}")).as_deref(), Some(id));
         assert_eq!(codex_resume_id("node /opt/homebrew/bin/codex"), None, "a fresh chat");
         assert_eq!(codex_resume_id("node /opt/homebrew/bin/codex resume --last"), None, "no id to go on");
+    }
+
+    /// The folder a process runs in, asked of the kernel: this process's own must match.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn finds_a_process_folder_without_lsof() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(proc_cwd(std::process::id() as i32).map(|p| p.canonicalize().unwrap()), Some(here.canonicalize().unwrap()));
+        assert_eq!(proc_cwd(i32::MAX), None, "no such process");
     }
 
     #[test]
