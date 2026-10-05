@@ -62,95 +62,129 @@ fn put(px: &mut Pixels, x: usize, y: usize, c: Color) {
 /// `frame` alternates the chewing animation.
 pub fn sprite(fat: usize, mood: Mood, frame: u64) -> Pixels {
     let fat = fat.min(4);
-    let (h, w) = (10, 10 + 2 * fat);
-    let running = mood == Mood::Running;
-    // the bottom row is feet, or the treadmill the feet run on
-    let body_h = if running { h - 2 } else { h - 1 };
-    let inside = |x: isize, y: isize| {
-        if x < 0 || y < 0 || x >= w as isize || y >= body_h as isize {
-            return false;
-        }
-        let dx = (x as f32 + 0.5 - w as f32 / 2.0) / (w as f32 / 2.0);
-        let dy = (y as f32 + 0.5 - body_h as f32 / 2.0) / (body_h as f32 / 2.0);
-        dx * dx + dy * dy <= 1.0
-    };
-    let mut px: Pixels = vec![vec![None; w]; h];
-    for y in 0..body_h {
-        for x in 0..w {
-            let (xi, yi) = (x as isize, y as isize);
-            if inside(xi, yi) {
-                let edge = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|(a, b)| !inside(xi + a, yi + b));
-                put(&mut px, x, y, if edge { EDGE } else { BODY });
-            }
-        }
-    }
-    let chewing = mood == Mood::Munching && frame % 2 == 0;
+    let w = 10 + 2 * fat;
+    let c = w / 2;
+    let phase = (frame % 2) as usize;
+    let mut px: Pixels = vec![vec![None; w]; 10];
 
-    // belly: a lighter patch below the face that grows with the body
-    let (bx, by) = (w as f32 / 2.0, body_h as f32 * 0.74);
-    let (rx, ry) = (w as f32 * 0.32, body_h as f32 * 0.22);
-    for y in 5..body_h {
-        for x in 0..w {
-            let dx = (x as f32 + 0.5 - bx) / rx;
-            let dy = (y as f32 + 0.5 - by) / ry;
-            if dx * dx + dy * dy <= 1.0 && px[y][x] == Some(BODY) {
-                put(&mut px, x, y, BELLY);
-            }
-        }
+    // Two rounded ear tips, joined by a low crown.
+    for x in [1, 2, w - 3, w - 2] {
+        put(&mut px, x, 0, EDGE);
+    }
+    for x in 0..w {
+        let rim = x == 0 || x == w - 1 || (x >= 3 && x < w - 3);
+        put(&mut px, x, 1, if rim { EDGE } else { BODY });
     }
 
-    let (c0, c1, d) = (w / 2 - 1, w / 2, 1 + fat / 2);
-    let (left, right) = (c0 - d, c1 + d); // inner pixel of each 2x2 eye
-    // petting squeezes its eyes shut with pleasure, every other frame
-    let squinting = mood == Mood::Petted && frame % 2 == 0;
-    for (inner, outer) in [(left, left - 1), (right, right + 1)] {
-        if mood != Mood::Sleepy && !squinting {
-            put(&mut px, inner, 3, SHINE);
-            put(&mut px, outer, 3, EYE);
+    // Broad cheeks and a soft, straight-sided bun silhouette.
+    for y in 2..8 {
+        for x in 0..w {
+            let rim = x == 0 || x == w - 1;
+            put(&mut px, x, y, if rim { EDGE } else { BODY });
         }
-        put(&mut px, inner, 4, EYE);
-        put(&mut px, outer, 4, EYE);
     }
-    put(&mut px, left - 1, 5, BLUSH);
-    put(&mut px, right + 1, 5, BLUSH);
-    if mood == Mood::Petted {
-        // and brings the colour to its cheeks — below the eyes, never over them: rows 3 and 4
-        // are the eyes themselves, and painting one pink looks like a blindfold, not a blush
-        put(&mut px, left - 2, 5, BLUSH);
-        put(&mut px, right + 2, 5, BLUSH);
-        put(&mut px, left - 1, 6, BLUSH);
-        put(&mut px, right + 1, 6, BLUSH);
+    for x in 3..w - 3 {
+        put(&mut px, x, 6, BELLY);
     }
-    let mouth = match mood {
-        Mood::Munching if chewing => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
-        Mood::Munching | Mood::Sleepy => vec![(c0, 6, EDGE), (c1, 6, EDGE)],
-        Mood::Waiting => vec![(c0, 6, MOUTH), (c1, 6, MOUTH)],
-        // panting, open wider on the stride where both feet are down
-        Mood::Running if frame % 2 == 0 => vec![(c0, 5, MOUTH), (c1, 5, MOUTH), (c0, 6, MOUTH), (c1, 6, MOUTH)],
-        Mood::Running => vec![(c0, 6, MOUTH), (c1, 6, MOUTH)],
-        // a wide smile, wider than happy: the corners lift another pixel
-        Mood::Petted => vec![(c0 - 2, 5, EYE), (c1 + 2, 5, EYE), (c0 - 1, 6, EYE), (c1 + 1, 6, EYE), (c0, 6, EYE), (c1, 6, EYE)],
-        Mood::Happy => vec![(c0 - 1, 5, EYE), (c1 + 1, 5, EYE), (c0, 6, EYE), (c1, 6, EYE)],
-    };
-    for (x, y, c) in mouth {
-        put(&mut px, x, y, c);
-    }
-    let foot = c0 - 1 - fat / 2;
-    if running {
-        // one leg reaches forward while the other pushes back, and they swap every frame,
-        // over a belt whose markings crawl the other way
-        let step: isize = if frame % 2 == 0 { 1 } else { -1 };
-        for (x, dir) in [(foot - 1, -step), (foot, -step), (w - 1 - foot, step), (w - foot, step)] {
-            put(&mut px, x.saturating_add_signed(dir), h - 2, EDGE);
+
+    if mood == Mood::Running {
+        // The whole body fits above the legs and treadmill.
+        px[7].fill(None);
+        for x in 1..w - 1 {
+            put(&mut px, x, 7, EDGE);
+        }
+        for x in [
+            2 + phase,
+            3 + phase,
+            w - 4 - phase,
+            w - 3 - phase,
+        ] {
+            put(&mut px, x, 8, EDGE);
         }
         for x in 0..w {
-            put(&mut px, x, h - 1, if (x + frame as usize) % 4 < 2 { BELT } else { TREAD });
+            let colour = if (x + phase) % 4 < 2 { BELT } else { TREAD };
+            put(&mut px, x, 9, colour);
         }
     } else {
-        for x in [foot - 1, foot, w - 1 - foot, w - foot] {
-            put(&mut px, x, h - 1, EDGE);
+        for x in 2..w - 2 {
+            put(&mut px, x, 7, BELLY);
+        }
+        for x in 1..w - 1 {
+            let colour = if x == 1 || x == w - 2 {
+                EDGE
+            } else if x == 2 || x == w - 3 {
+                BODY
+            } else {
+                BELLY
+            };
+            put(&mut px, x, 8, colour);
+        }
+        // Both two-pixel paws touch the underside.
+        for x in [2, 3, w - 4, w - 3] {
+            put(&mut px, x, 9, EDGE);
         }
     }
+
+    let (left, right) = (c - 3, c + 2);
+    let closed = mood == Mood::Sleepy
+        || (mood == Mood::Petted && phase == 0);
+
+    if closed {
+        for x in [left, left + 1, right - 1, right] {
+            put(&mut px, x, 3, EYE);
+        }
+    } else {
+        // Two-pixel dark columns, with inward-facing highlights.
+        // No EYE shares a vertical safe-render pair with SHINE.
+        for x in [left, right] {
+            put(&mut px, x, 2, EYE);
+            put(&mut px, x, 3, EYE);
+        }
+        put(&mut px, left + 1, 2, SHINE);
+        put(&mut px, right - 1, 2, SHINE);
+    }
+
+    // Cheeks occupy a separate vertical pair from the eyes.
+    for x in [left - 1, right + 1] {
+        put(&mut px, x, 4, BLUSH);
+    }
+    if mood == Mood::Petted {
+        for x in [left, right] {
+            put(&mut px, x, 4, BLUSH);
+        }
+    }
+
+    match mood {
+        Mood::Happy | Mood::Petted => {
+            // Raised corners and a low centre: a small curved smile.
+            put(&mut px, c - 2, 4, MOUTH);
+            put(&mut px, c + 1, 4, MOUTH);
+            put(&mut px, c - 1, 5, MOUTH);
+            put(&mut px, c, 5, MOUTH);
+        }
+        Mood::Munching | Mood::Running => {
+            if phase == 0 {
+                for y in 4..=5 {
+                    for x in c - 1..=c {
+                        put(&mut px, x, y, MOUTH);
+                    }
+                }
+            } else {
+                // A sideways chew, distinct even after pair collapse.
+                for x in c - 1..=c + 1 {
+                    put(&mut px, x, 5, MOUTH);
+                }
+            }
+        }
+        Mood::Waiting => {
+            put(&mut px, c, 4, MOUTH);
+            put(&mut px, c, 5, MOUTH);
+        }
+        Mood::Sleepy => {
+            put(&mut px, c - 1, 5, MOUTH);
+        }
+    }
+
     px
 }
 
@@ -213,51 +247,55 @@ pub fn small(fat: usize, mood: Mood, frame: u64) -> Vec<Line<'static>> {
 
 fn small_px(fat: usize, mood: Mood, frame: u64) -> Pixels {
     let w = 6 + fat.min(4);
+    let c = w / 2;
+    let (left, right) = (c - 2, c + 1);
+    let phase = (frame % 2) as usize;
     let mut px: Pixels = vec![vec![None; w]; 4];
-    for x in 1..w - 1 {
-        put(&mut px, x, 0, EDGE); // the top of its head, corners left round
+
+    // Ear nubs above the eyes leave BODY visible in safe mode.
+    for x in [left, right] {
+        put(&mut px, x, 0, EDGE);
     }
     for x in 0..w {
         let rim = x == 0 || x == w - 1;
         put(&mut px, x, 1, if rim { EDGE } else { BODY });
         put(&mut px, x, 2, if rim { EDGE } else { BELLY });
     }
-    // eyes either side of the middle, feet below them, as on the big one
-    let (left, right) = (w / 2 - 2, w / 2 + 1);
-    // At one pixel an eye, a squint is indistinguishable from the rim it is drawn in — the
-    // face just loses its eyes — so only sleep closes them here. Petting shows in the cheeks
-    // and the grin instead.
-    let eye = if mood == Mood::Sleepy { EDGE } else { EYE };
-    put(&mut px, left, 1, eye);
-    put(&mut px, right, 1, eye);
+
+    // At header scale, retain both eyes in every mood.
+    for x in [left, right] {
+        put(&mut px, x, 1, EYE);
+    }
     if mood == Mood::Petted {
-        // cheeks beside the eyes, or on the rim itself when it is too thin to have room
-        put(&mut px, left.saturating_sub(1), 1, BLUSH);
-        put(&mut px, (right + 1).min(w - 1), 1, BLUSH);
-    }
-    // the mouth works while it does: chewing and panting open and close it
-    let busy = matches!(mood, Mood::Munching | Mood::Running);
-    if mood != Mood::Sleepy && (!busy || frame % 2 == 0) {
-        put(&mut px, w / 2 - 1, 2, MOUTH);
-        put(&mut px, w / 2, 2, MOUTH);
-        if mood == Mood::Petted && frame % 2 == 0 {
-            put(&mut px, w / 2 - 2, 2, MOUTH); // the grin spreads and settles again
-            put(&mut px, w / 2 + 1, 2, MOUTH);
+        // Exactly two cheeks, clear of both eyes at every width.
+        for x in [0, w - 1] {
+            put(&mut px, x, 1, BLUSH);
         }
     }
+
+    // Keep a mouth in every state; chewing and petting change its width.
+    put(&mut px, c - 1, 2, MOUTH);
+    let narrow = mood == Mood::Sleepy
+        || (matches!(mood, Mood::Munching | Mood::Running | Mood::Petted)
+            && phase == 1);
+    if !narrow {
+        put(&mut px, c, 2, MOUTH);
+    }
+
     if mood == Mood::Running {
-        // every other cell, so the feet can never sit on all the markings at once and leave
-        // the belt looking still — at six cells wide there are only three of them
         for x in 0..w {
-            put(&mut px, x, 3, if (x + frame as usize) % 2 == 0 { BELT } else { TREAD });
+            let colour = if (x + phase) % 2 == 0 { BELT } else { TREAD };
+            put(&mut px, x, 3, colour);
         }
-        let stride = usize::from(frame % 2 == 0); // feet travel along the belt
+        let stride = usize::from(phase == 0);
         put(&mut px, left + stride, 3, EDGE);
         put(&mut px, right - stride, 3, EDGE);
     } else {
-        put(&mut px, left, 3, EDGE);
-        put(&mut px, right, 3, EDGE);
+        // Attached outer toes leave the tiny belly visible in safe mode.
+        put(&mut px, 0, 3, EDGE);
+        put(&mut px, w - 1, 3, EDGE);
     }
+
     px
 }
 
@@ -379,10 +417,6 @@ mod tests {
         }
     }
 
-    fn w(fat: usize) -> usize {
-        10 + 2 * fat
-    }
-
     /// Petting it has to be visible, or clicking the thing does nothing you can see: rosy
     /// cheeks, a wider grin, and eyes that squeeze shut and open again.
     #[test]
@@ -395,11 +429,15 @@ mod tests {
             assert!(blush(&pet) > blush(&happy), "fat {fat}: rosier than usual");
             let shut = pet.iter().flatten().filter(|c| **c == Some(SHINE)).count();
             assert_eq!(shut, 0, "fat {fat}: eyes squeezed shut on this frame");
-            // the cheeks must not land on the eyes, which would read as a blindfold
-            let (open, d) = (sprite(fat, Mood::Petted, 1), 1 + fat / 2);
-            let (l, r) = (w(fat) / 2 - 1 - d, w(fat) / 2 + d);
-            for (x, y) in [(l, 3), (l - 1, 3), (l, 4), (l - 1, 4), (r, 3), (r + 1, 3), (r, 4), (r + 1, 4)] {
-                assert!(matches!(open[y][x], Some(EYE) | Some(SHINE)), "fat {fat}: ({x},{y}) is still an eye");
+            // the cheeks must not land on the eyes, which would read as a blindfold: whatever is
+            // an eye or its highlight when content is still one on the open petted frame
+            let open = sprite(fat, Mood::Petted, 1);
+            for (y, row) in happy.iter().enumerate() {
+                for (x, c) in row.iter().enumerate() {
+                    if matches!(c, Some(EYE) | Some(SHINE)) {
+                        assert!(matches!(open[y][x], Some(EYE) | Some(SHINE)), "fat {fat}: ({x},{y}) is still an eye");
+                    }
+                }
             }
         }
         for fat in 0..=4 {
