@@ -555,9 +555,10 @@ impl App {
                         self.sessions[i].refresh_usage(); // a new agent in front: follow its usage
                     }
                     self.sessions[i].on_output();
+                    // the screen first: it can say the agent is waiting, which check_status reports
+                    let shown = self.sessions[i].check_screen();
                     let status = self.check_status(i);
-                    let folding = self.sessions[i].check_compacting();
-                    agent || status || folding || (i == self.sel && self.diff.is_none() && !self.dash)
+                    agent || status || shown || (i == self.sel && self.diff.is_none() && !self.dash)
                 }
                 None => false,
             },
@@ -626,9 +627,11 @@ impl App {
             if self.sessions[i].on_tick() {
                 self.check_status(i);
             }
-            // the output that takes the compaction hint off the screen can be the last one for
-            // a while, and may fall inside the check's own quiet window, so look again here
-            self.sessions[i].check_compacting();
+            // the output that takes a hint or a prompt off the screen can be the last one for a
+            // while, and may fall inside the check's own quiet window, so look again here
+            if self.sessions[i].check_screen() {
+                self.check_status(i);
+            }
         }
         let every = if self.dash { 2 } else { 3 };
         if self.last_usage.elapsed() >= every * TICK {

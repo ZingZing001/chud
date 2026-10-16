@@ -123,6 +123,9 @@ pub struct Signals {
     pub status: Status,
     /// the program reports progress itself (OSC 9;4), so its status is never guessed
     pub progress_seen: bool,
+    /// a choice is on screen waiting for the user (see `Session::check_screen`): Copilot keeps
+    /// reporting itself busy the whole time it waits, which must not read as working
+    pub asking: bool,
     pub title: String,
     pub chat: String,
     pub summary: String,
@@ -150,6 +153,9 @@ impl vt100::Callbacks for Signals {
             // progress (Copilot): 0 = cleared, anything else = busy
             [b"9", b"4", state, ..] => {
                 self.progress_seen = true;
+                if self.asking && *state != b"0" {
+                    return; // "busy" while it waits on you is still waiting on you
+                }
                 self.set(if *state == b"0" { Status::Done } else { Status::Working }, None)
             }
             [b"9", ..] => self.notify(Some(rest(1))),
@@ -581,6 +587,7 @@ impl Session {
         let s = p.callbacks_mut();
         s.chat.clear(); // a different program: the old chat name and summary no longer apply
         s.summary.clear();
+        s.asking = false;
         true
     }
 
@@ -642,17 +649,42 @@ impl Session {
     /// Is the agent compacting? Nothing reports it — no hook, no escape sequence — so this reads
     /// what is on screen, at most three times a second and only for an agent that says so.
     /// ponytail: Claude's wording; other agents simply never show the treadmill.
-    pub fn check_compacting(&mut self) -> bool {
-        if self.exit.is_some() || self.agent != Agent::Claude {
-            return std::mem::take(&mut self.compacting);
+    /// What the agent's screen says that nothing else reports, at most three times a second:
+    /// - Claude compacting: it prints "Compacting conversation" by its spinner, and has no hook
+    ///   or escape sequence for it.
+    /// - Copilot waiting for an answer: it keeps sending its busy progress signal (OSC 9;4;3)
+    ///   every five seconds while a choice sits on screen, so only the screen tells the two
+    ///   apart. Every Copilot choice — run this command, trust this folder — ends with the same
+    ///   footer, "↑/↓ to navigate · enter to select · esc to cancel".
+    /// True when what is shown changed.
+    /// ponytail: these agents' wording; a reworded prompt silently stops being noticed.
+    pub fn check_screen(&mut self) -> bool {
+        let watched = matches!(self.agent, Agent::Claude | Agent::Copilot);
+        if self.exit.is_some() || !watched {
+            let asking = std::mem::take(&mut self.parser.lock().unwrap().callbacks_mut().asking);
+            return std::mem::take(&mut self.compacting) || asking;
         }
         if self.compact_checked.elapsed() < Duration::from_millis(300) {
             return false;
         }
         self.compact_checked = Instant::now();
-        let screen = self.parser.lock().unwrap().screen().contents();
-        let now = screen.contains("Compacting conversation") || screen.contains("Compacting at auto window");
-        std::mem::replace(&mut self.compacting, now) != now
+        let mut p = self.parser.lock().unwrap();
+        let screen = p.screen().contents();
+        if self.agent == Agent::Claude {
+            let now = screen.contains("Compacting conversation") || screen.contains("Compacting at auto window");
+            return std::mem::replace(&mut self.compacting, now) != now;
+        }
+        let now = screen.contains("to navigate · enter to select");
+        let signals = p.callbacks_mut();
+        if std::mem::replace(&mut signals.asking, now) == now {
+            return false;
+        }
+        if now {
+            signals.status = Status::NeedsInput;
+        } else if signals.status == Status::NeedsInput {
+            signals.status = Status::Working; // answered: back to what it was asked to do
+        }
+        true
     }
 
     /// Codex chooses its own session id and writes no marker chud could match by pid, so its
@@ -826,6 +858,21 @@ mod tests {
         assert_eq!(s.status, Status::NeedsInput, "an unprompted notification still needs you");
         assert_eq!(s.summary, "Claude needs your permission to use Bash");
         assert_eq!(feed(b"\x07").status, Status::Idle, "but a bare beep (zsh completion) does not");
+    }
+
+    /// Copilot (CLI 1.0, captured in a pty) keeps sending OSC 9;4;3 — busy — every five seconds
+    /// the whole time "Do you want to run this command?" waits for an answer.
+    #[test]
+    fn busy_while_asking_is_still_asking() {
+        let mut p = vt100::Parser::new_with_callbacks(40, 120, 0, Signals::default());
+        p.process(b"\x1b]9;4;3;0\x07");
+        assert_eq!(p.callbacks().status, Status::Working);
+        p.callbacks_mut().asking = true; // the screen check saw the prompt
+        p.callbacks_mut().status = Status::NeedsInput;
+        p.process(b"\x1b]9;4;3;0\x07\x1b]9;4;3;0\x07");
+        assert_eq!(p.callbacks().status, Status::NeedsInput, "its five-second heartbeat does not hide the question");
+        p.process(b"\x1b]9;4;0;0\x07");
+        assert_eq!(p.callbacks().status, Status::Done, "but finishing still counts");
     }
 
     #[test]

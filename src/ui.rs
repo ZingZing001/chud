@@ -694,7 +694,11 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
 
     hits.push((cards, Hit::Cards));
     let per_row = (cards.width / CARD_W).max(1);
-    for (k, &i) in order.iter().skip(app.dash_scroll as usize * per_row as usize).enumerate() {
+    // whoever is waiting on you comes first, so it can never be scrolled out of sight; the rest
+    // keep the sidebar's order (the sort is stable)
+    let mut shown = order.clone();
+    shown.sort_by_key(|&i| app.sessions[i].status() != Status::NeedsInput);
+    for (k, &i) in shown.iter().skip(app.dash_scroll as usize * per_row as usize).enumerate() {
         let (col, row) = (k as u16 % per_row, k as u16 / per_row);
         if (row + 1) * CARD_H > cards.height {
             break;
