@@ -92,6 +92,16 @@ pub fn codex_status(title: &str, now: Status) -> Status {
     }
 }
 
+/// Copilot is waiting for you: one of its prompts is on screen. It has two kinds, each ending in
+/// its own footer of key hints, which goes away once answered (captured from Copilot CLI 1.0):
+/// - permission and trust: "Do you want to run this command?" ... "↑/↓ to navigate · enter to
+///   select · esc to cancel"
+/// - questions, with choices or typed: "Copilot needs information." ... "↑/↓ select · enter
+///   accept · ctrl+d decline · esc cancel" (no "↑/↓ select" when the answer is typed)
+pub fn copilot_asking(screen: &str) -> bool {
+    ["to navigate · enter to select", "enter accept · ctrl+d decline"].iter().any(|footer| screen.contains(footer))
+}
+
 /// The chat a codex command line resumes, as `ps` shows it: `node /opt/homebrew/bin/codex
 /// resume <id>`, where the npm shim puts node in front.
 fn codex_resume_id(args: &str) -> Option<String> {
@@ -653,9 +663,8 @@ impl Session {
     /// - Claude compacting: it prints "Compacting conversation" by its spinner, and has no hook
     ///   or escape sequence for it.
     /// - Copilot waiting for an answer: it keeps sending its busy progress signal (OSC 9;4;3)
-    ///   every five seconds while a choice sits on screen, so only the screen tells the two
-    ///   apart. Every Copilot choice — run this command, trust this folder — ends with the same
-    ///   footer, "↑/↓ to navigate · enter to select · esc to cancel".
+    ///   every five seconds while it waits, so only the screen tells the two apart (see
+    ///   `copilot_asking`).
     /// True when what is shown changed.
     /// ponytail: these agents' wording; a reworded prompt silently stops being noticed.
     pub fn check_screen(&mut self) -> bool {
@@ -674,7 +683,7 @@ impl Session {
             let now = screen.contains("Compacting conversation") || screen.contains("Compacting at auto window");
             return std::mem::replace(&mut self.compacting, now) != now;
         }
-        let now = screen.contains("to navigate · enter to select");
+        let now = copilot_asking(&screen);
         let signals = p.callbacks_mut();
         if std::mem::replace(&mut signals.asking, now) == now {
             return false;
@@ -873,6 +882,19 @@ mod tests {
         assert_eq!(p.callbacks().status, Status::NeedsInput, "its five-second heartbeat does not hide the question");
         p.process(b"\x1b]9;4;0;0\x07");
         assert_eq!(p.callbacks().status, Status::Done, "but finishing still counts");
+    }
+
+    /// The footers of every kind of Copilot prompt, as a real Copilot drew them in a pty.
+    #[test]
+    fn copilot_prompts_of_every_kind_are_noticed() {
+        let permission = "│ Do you want to run this command?       │\n│ ❯ 1. Yes                     │\n│ ↑/↓ to navigate · enter to select · esc to cancel       │";
+        let choice = " Copilot needs information.\n Do you prefer red or blue?\n ❯ red\n   blue\n ↑/↓ select · enter accept · ctrl+d decline · esc cancel";
+        let typed = " Copilot needs information.\n What is your favourite number?\n ❯\n enter accept · ctrl+d decline · esc cancel";
+        for (kind, screen) in [("permission", permission), ("choice", choice), ("typed answer", typed)] {
+            assert!(copilot_asking(screen), "{kind} prompt");
+        }
+        assert!(!copilot_asking(" ● Ran touch ~/x\n ○ Thinking…\n > "), "working is not asking");
+        assert!(!copilot_asking(" ✓ Asked user: red\n Copilot is typing"), "an answered question is not asking");
     }
 
     #[test]
