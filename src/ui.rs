@@ -36,15 +36,44 @@ pub fn label(s: Status) -> &'static str {
     }
 }
 
+/// One mark per state, everywhere. Only a session waiting on you is in colour: it is the one
+/// thing on screen that needs you to act.
 fn badge(s: Status) -> Span<'static> {
     match s {
-        Status::Idle => "○ ".dark_gray(),
-        Status::Working => "● ".yellow(),
-        Status::NeedsInput if now_secs() % 2 == 0 => "◐ ".magenta().bold(),
-        Status::NeedsInput => "◑ ".light_magenta().bold(),
-        Status::Done => "✓ ".green(),
-        Status::Exited => "✗ ".red(),
+        Status::Idle => "○ ".fg(pal().dim),
+        Status::Working => "● ".fg(pal().bar_fg),
+        Status::NeedsInput => "◐ ".fg(pal().accent).bold(),
+        Status::Done => "✓ ".fg(pal().dim),
+        Status::Exited => "✕ ".fg(pal().dim),
     }
+}
+
+/// `text` cut to `w` cells, ending in … when it had to be cut.
+fn fit(text: &str, w: usize) -> String {
+    if Span::raw(text).width() <= w {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for c in text.chars() {
+        if Span::raw(format!("{out}{c}…")).width() > w {
+            break;
+        }
+        out.push(c);
+    }
+    if w == 0 { out } else { out + "…" }
+}
+
+/// A usage percentage, in the accent once it is nearly used up, with a ! when it all but is.
+fn pct(used: f64) -> Span<'static> {
+    let text = format!("{used:.0}%{}", if used >= 95.0 { "!" } else { "" });
+    if used >= 80.0 { text.fg(pal().accent).bold() } else { text.into() }
+}
+
+/// Whether the agent has said how full its context is. A real conversation is never empty (its
+/// system prompt alone is thousands of tokens), so nothing yet means not known yet, not 0%.
+/// ponytail: no separate "reported" flag in Usage; add one if an agent ever reports a true zero
+fn context_known(s: &Session) -> bool {
+    s.usage.context > 0
 }
 
 /// Nerd Font icons only where the font is known to have them (chud.app bundles one, or you
@@ -106,7 +135,7 @@ fn until(at: u64) -> String {
 
 fn tokens(n: u64) -> String {
     match n {
-        0 => "-".into(),
+        0 => "—".into(), // nothing reported yet
         1..1000 => n.to_string(),
         1000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
         _ => format!("{:.2}M", n as f64 / 1e6),
@@ -425,21 +454,21 @@ fn session_header(f: &mut Frame, s: &Session, i: usize, plan: &Plan, area: Rect,
                 (Agent::Copilot, _, Some((q, total))) => {
                     spans.push(Span::raw("premium requests "));
                     spans.extend(bar(q));
-                    spans.push(format!(" {:.0}% of {total}", q.used).into());
+                    spans.extend([" ".into(), pct(q.used), format!(" of {total}").into()]);
                     spans.push(format!("  resets in {}", until(q.resets_at)).fg(pal().dim));
                 }
-                (Agent::Copilot, _, None) => spans.push("premium requests: checking with GitHub…".fg(pal().dim)),
+                (Agent::Copilot, _, None) => spans.push("premium requests —  asking GitHub".fg(pal().dim)),
                 (_, Some((h, week)), _) => {
-                    spans.push(Span::raw("5h limit "));
+                    spans.push(Span::raw("5h "));
                     spans.extend(bar(h));
-                    spans.push(format!(" {:.0}%", h.used).into());
+                    spans.extend([" ".into(), pct(h.used)]);
                     spans.push(format!("  resets in {}", until(h.resets_at)).fg(pal().dim));
                     if let Some(w) = week {
-                        spans.push(format!(" · week {:.0}%", w.used).fg(pal().dim));
+                        spans.extend([" · week ".fg(pal().dim), pct(w.used)]);
                     }
                 }
-                (Agent::Codex, None, _) => spans.push("5h limit shows after Codex's first reply".fg(pal().dim)),
-                _ => spans.push("5h limit shows after Claude's next reply".fg(pal().dim)),
+                (Agent::Codex, None, _) => spans.push("5h —  after Codex's first reply".fg(pal().dim)),
+                _ => spans.push("5h —  after Claude's next reply".fg(pal().dim)),
             }
         }
         Agent::Profile(_) | Agent::Shell | Agent::Other(_) => {
@@ -451,30 +480,36 @@ fn session_header(f: &mut Frame, s: &Session, i: usize, plan: &Plan, area: Rect,
             spans.push(format!("{program} · {}", s.cwd.display()).fg(pal().dim));
         }
     }
+    // the chud sits at the right of both rows; the words stop short of it rather than under it
+    let used = fullness(s);
+    let art = chud::small((used * 5.0) as usize, mood(s), now_secs());
+    let (w, gap) = (art[0].width() as u16, if split { 4 } else { 1 }); // clear of the ✕ button
+    let pet = area.width > w + gap + 44 && area.height > 1;
+    let words = |r: Rect| if pet { Rect { width: r.width - w - gap, ..r } } else { r };
     let [top, second] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), top);
+    f.render_widget(Block::new().bg(pal().bar_bg), area);
+    f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), words(top));
     if second.height == 0 {
         return; // a shell: one line, and the terminal keeps the row
     }
     // Row two: how full the context is, and the session's own chud — the dashboard's creature
     // at header size, as fat as the context it has eaten, running while the agent compacts.
-    let used = fullness(s);
     let mut below = vec![lead(), Span::raw("  "), "context ".fg(pal().dim)];
     if s.agent == Agent::Codex && s.usage.window == 0 {
         // codex names its window only once a turn starts; any number before that is a guess
-        below.push("shows after Codex's first reply".fg(pal().dim));
+        below.push("—  after Codex's first reply".fg(pal().dim));
+    } else if !context_known(s) {
+        below.push("—  after the first reply".fg(pal().dim));
     } else {
         below.extend(chud::bar(used, (area.width / 6).clamp(8, 20) as usize));
-        below.push(format!(" {:.0}%", used * 100.0).into());
+        below.extend([" ".into(), pct(used * 100.0)]);
         below.push(format!("  {} of {}", tokens(s.usage.context), tokens(s.usage.limit())).fg(pal().dim));
     }
     if s.compacting() {
         below.push("  compacting…".fg(pal().accent));
     }
-    f.render_widget(Line::from(below).fg(pal().bar_fg).bg(pal().bar_bg), second);
-    let art = chud::small((used * 5.0) as usize, mood(s), now_secs());
-    let (w, gap) = (art[0].width() as u16, if split { 4 } else { 1 }); // clear of the ✕ button
-    if area.width > w + gap + 44 {
+    f.render_widget(Line::from(below).fg(pal().bar_fg).bg(pal().bar_bg), words(second));
+    if pet {
         let at = Rect::new(area.right() - w - gap, area.y, w, 2.min(area.height));
         f.render_widget(Paragraph::new(art), at);
         hits.push((at, Hit::Pet(i))); // it likes being clicked
@@ -498,9 +533,13 @@ fn toolbar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         x += w + 1;
     }
     let count = |st| app.sessions.iter().filter(|s| s.status() == st).count();
+    let waiting = count(Status::NeedsInput);
     let right = Line::from(vec![
-        format!("● {} working  ", count(Status::Working)).yellow(),
-        format!("◐ {} need you ", count(Status::NeedsInput)).magenta(),
+        format!("● {} working  ", count(Status::Working)).fg(pal().dim),
+        match waiting {
+            0 => "no one needs you ".fg(pal().dim),
+            n => format!("◐ {n} need{} you ", if n == 1 { "s" } else { "" }).fg(pal().accent).bold(),
+        },
     ]);
     f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), area);
     f.render_widget(right.right_aligned(), area);
@@ -523,7 +562,7 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
                     if i == app.sel {
                         selected = Some(ri);
                     }
-                    (session_item(&app.sessions[i], num, headers), Hit::Session(i))
+                    (session_item(&app.sessions[i], num, headers, area.width.saturating_sub(1)), Hit::Session(i))
                 }
             };
             // a base style, not List's highlight_style: that paints over the chud's pixel colours
@@ -578,23 +617,25 @@ fn group_header(app: &App, gi: usize) -> ListItem<'static> {
     let arrow = if g.collapsed { "▸" } else { "▾" };
     let mut line = vec![format!("{arrow} {} ({})", g.name, members.len()).cyan().bold()];
     if waiting > 0 {
-        line.push(format!(" ◐{waiting}").magenta().bold());
+        line.push(format!(" ◐{waiting}").fg(pal().accent).bold());
     }
     if g.collapsed && unread > 0 {
-        line.push(format!(" •{unread}").magenta());
+        line.push(format!(" •{unread}").fg(pal().bar_fg));
     }
     ListItem::new(Line::from(line))
 }
 
-/// Two lines: the agent's icon and the name, then its fullness bar and what it's doing.
-fn session_item(s: &Session, num: usize, headers: bool) -> ListItem<'static> {
+/// Two lines, `width` cells wide: the agent's icon, its state and the name (clear of the … menu
+/// in the last two cells), then what it is doing, with how full its context is at the right.
+fn session_item(s: &Session, num: usize, headers: bool, width: u16) -> ListItem<'static> {
     let st = s.status();
     let pad = if headers { " " } else { "" };
-    let name = format!("{num} {}", s.label());
-    let mut first =
-        vec![Span::raw(pad), icon(&s.agent), badge(st), if s.unread { name.bold() } else { name.into() }];
+    let mut first = vec![Span::raw(pad), icon(&s.agent), badge(st)];
+    let used: usize = first.iter().map(Span::width).sum::<usize>() + if s.unread { 2 } else { 0 };
+    let name = fit(&format!("{num} {}", s.label()), (width as usize).saturating_sub(used + 2));
+    first.push(if s.unread { name.bold() } else { name.into() });
     if s.unread {
-        first.push(" •".magenta().bold());
+        first.push(" •".fg(pal().bar_fg).bold());
     }
     let detail = match (st, s.exit) {
         (Status::Exited, Some(code)) => format!("exited {code}"),
@@ -604,14 +645,24 @@ fn session_item(s: &Session, num: usize, headers: bool) -> ListItem<'static> {
         Some(t) => format!("{} · {detail}", elapsed(t.elapsed())),
         None => detail,
     };
-    let mut second = vec![Span::raw(format!("{pad}    "))];
-    if has_usage(s) {
-        second.extend(chud::bar(fullness(s), 8));
-        second.push(format!(" {:>3.0}% ", fullness(s) * 100.0).fg(pal().dim));
-    } else {
-        second.push(format!("{} · ", s.folder()).fg(pal().dim));
+    let detail = if has_usage(s) { detail } else { format!("{} · {detail}", s.folder()) };
+    let indent = format!("{pad}    ");
+    let full = match (has_usage(s), context_known(s)) {
+        (false, _) => None,
+        (true, false) => Some("—".fg(pal().dim)),
+        (true, true) => Some(match pct(fullness(s) * 100.0) {
+            p if p.style.fg.is_some() => p,
+            p => p.fg(pal().dim),
+        }),
+    };
+    let right = full.as_ref().map_or(0, |p| p.width() + 1); // and a space before it
+    let detail = fit(&detail, (width as usize).saturating_sub(indent.len() + right));
+    let used = indent.len() + Span::raw(detail.as_str()).width();
+    let mut second = vec![Span::raw(indent), detail.fg(pal().dim)];
+    if let Some(p) = full {
+        let gap = (width as usize).saturating_sub(used + p.width());
+        second.extend([Span::raw(" ".repeat(gap)), p]);
     }
-    second.push(detail.fg(pal().dim));
     ListItem::new(vec![Line::from(first), Line::from(second)])
 }
 
@@ -636,16 +687,18 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let (eaten, produced, credits) = app.sessions.iter().fold((0, 0, 0.0), |(e, p, c), s| {
         (e + s.usage.input + s.usage.output, p + s.usage.output, c + s.usage.credits)
     });
+    let waiting = count(Status::NeedsInput);
     let tile_data = [
-        (count(Status::Working).to_string(), "working", Color::Yellow),
-        (count(Status::NeedsInput).to_string(), "need you", Color::Magenta),
-        (count(Status::Done).to_string(), "done", Color::Green),
-        (tokens(eaten), "tokens eaten", pal().accent),
-        (tokens(produced), "produced", Color::Cyan),
-        (format!("{credits:.1}"), "copilot credits", pal().copilot),
+        (count(Status::Working).to_string(), "working", pal().bar_fg),
+        (waiting.to_string(), "need you", if waiting > 0 { pal().accent } else { pal().dim }),
+        (count(Status::Done).to_string(), "done", pal().bar_fg),
+        (tokens(eaten), "tokens eaten", pal().bar_fg),
+        (tokens(produced), "produced", pal().bar_fg),
+        (if credits > 0.0 { format!("{credits:.1}") } else { "—".into() }, "credits", pal().copilot),
     ];
     let boxes: [Rect; 6] = Layout::horizontal([Constraint::Fill(1); 6]).spacing(1).areas(tiles);
     for ((value, what, color), r) in tile_data.into_iter().zip(boxes) {
+        let color = if value == "0" || value == "—" { pal().dim } else { color };
         let text = Line::from(vec![value.fg(color).bold(), format!(" {what}").fg(pal().dim)]);
         f.render_widget(Paragraph::new(text).centered().block(Block::bordered().border_style(pal().dim)), r);
     }
@@ -791,11 +844,13 @@ fn card(f: &mut Frame, s: &Session, selected: bool, r: Rect) {
     let mut lines: Vec<Line> = chud_art(s).into_iter().map(Line::centered).collect();
     let name: String = s.label().chars().take(inner.width as usize).collect();
     lines.push(Line::from(name.bold()).centered());
-    if has_usage(s) {
+    if has_usage(s) && context_known(s) {
         let p = fullness(s);
         let mut bar = chud::bar(p, inner.width.saturating_sub(6) as usize);
-        bar.push(format!(" {:>3.0}%", p * 100.0).into());
+        bar.extend([" ".into(), pct(p * 100.0)]);
         lines.push(Line::from(bar).centered());
+    } else if has_usage(s) {
+        lines.push(Line::from("context —".fg(pal().dim)).centered());
     } else {
         lines.push(Line::from(s.folder().fg(pal().dim)).centered());
     }
@@ -877,11 +932,20 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         _ if app.prefix => " n new · / find · | split · - stack · o next pane · w close pane · r rename · g group · f zoom · y copy · s dashboard · d diff · x kill · ? help ",
         _ => " C-a ? help · click, drag and scroll with the mouse ",
     };
-    let mut spans = vec![if app.prefix { keys.black().on_yellow() } else { keys.into() }];
-    let waiting = app.sessions.iter().filter(|s| s.status() == Status::NeedsInput).count();
-    if waiting > 0 {
-        spans.push(format!(" {waiting} need input ").black().on_magenta());
-    }
+    // who is waiting on you, by name, and the key that goes there: it comes before the usual
+    // hints, after the ones for what you are in the middle of (a drag, a selection, C-a)
+    let waiting: Vec<&Session> = app.sessions.iter().filter(|s| s.status() == Status::NeedsInput).collect();
+    let queue = waiting.first().map(|s| {
+        let more = if waiting.len() > 1 { format!(" +{}", waiting.len() - 1) } else { String::new() };
+        format!(" ◐ {} needs you{more} · C-a Tab ", s.label()).fg(pal().on_accent).bg(pal().accent).bold()
+    });
+    let busy = app.select || app.prefix || matches!(app.drag, Some(Drag { moved: true, .. }));
+    let keys = if app.prefix { keys.black().on_yellow() } else { keys.into() };
+    let mut spans = match (queue, busy) {
+        (Some(q), false) => vec![q, keys],
+        (Some(q), true) => vec![keys, q],
+        (None, _) => vec![keys],
+    };
     match &app.update {
         Some(Update::Ready(commit)) => spans.push(format!(" ⟳ {commit} installed · restart chud ").black().on_green()),
         Some(Update::Failed(why)) => spans.push(format!(" ⟳ update failed: {why} ").black().on_red()),
@@ -940,15 +1004,41 @@ const HELP: &[(&str, &str)] = &[
     ("chud --setup", "run the first-start walkthrough again"),
 ];
 
+/// Every key and what it does, sized to the longest of each so nothing runs together or off
+/// the edge; in a window too narrow for that, descriptions wrap under themselves.
 fn help(f: &mut Frame) {
     let a = f.area();
-    let (w, h) = (74.min(a.width), (HELP.len() as u16 + 2).min(a.height));
+    let key_w = HELP.iter().map(|(k, _)| Span::raw(*k).width()).max().unwrap_or(0) + 2;
+    let text_w = HELP.iter().map(|(_, v)| Span::raw(*v).width()).max().unwrap_or(0);
+    let w = ((key_w + text_w + 3) as u16).min(a.width);
+    let room = (w as usize).saturating_sub(key_w + 3).max(10);
+    let mut lines: Vec<Line> = vec![];
+    for (k, v) in HELP {
+        // a description too long for the window carries on under itself, not under the keys
+        let mut rows = vec![String::new()];
+        for word in v.split(' ') {
+            let last = rows.last_mut().unwrap();
+            if !last.is_empty() && Span::raw(format!("{last} {word}")).width() > room {
+                rows.push(word.to_string());
+            } else if last.is_empty() {
+                last.push_str(word);
+            } else {
+                *last = format!("{last} {word}");
+            }
+        }
+        for (n, row) in rows.into_iter().enumerate() {
+            let key = if n == 0 { *k } else { "" };
+            lines.push(Line::from(vec![format!(" {key:<key_w$}").fg(pal().bar_fg).bold(), row.fg(pal().bar_fg)]));
+        }
+    }
+    let h = (lines.len() as u16 + 5).min(a.height);
     let r = Rect::new((a.width - w) / 2, (a.height - h) / 2, w, h);
-    let lines: Vec<Line> =
-        HELP.iter().map(|(k, v)| Line::from(vec![format!(" {k:<17}").yellow(), (*v).into()])).collect();
+    lines.push(Line::default());
+    lines.push(Line::from(" The chud gets fatter the longer its agent works.".fg(pal().dim)));
+    lines.push(Line::from(" Click or press any key to close.".fg(pal().dim)));
     f.render_widget(Clear, r);
-    let title = " chud · the chud gets fatter the longer its agent works · click or any key closes ";
-    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), r);
+    let block = Block::bordered().title(" Help ").border_style(pal().dim);
+    f.render_widget(Paragraph::new(lines).block(block), r);
 }
 
 fn prompt(f: &mut Frame, p: &Prompt, hits: &mut Hits) {
@@ -985,6 +1075,14 @@ fn prompt(f: &mut Frame, p: &Prompt, hits: &mut Hits) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_names_end_in_an_ellipsis_within_their_cells() {
+        assert_eq!(super::fit("api review", 20), "api review");
+        assert_eq!(super::fit("Run Shell Command Date", 10), "Run Shell…");
+        assert_eq!(super::fit("日本語のセッション", 7), "日本語…", "wide characters count as two cells");
+        assert_eq!(super::fit("anything", 0), "");
+    }
+
     #[test]
     fn block_glyphs_only_where_they_draw_right() {
         assert!(super::block_glyphs(Some("chud-app"), None), "chud.app bundles a font that draws them");
