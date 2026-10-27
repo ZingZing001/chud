@@ -276,8 +276,17 @@ pub struct Session {
     /// the agent in front and the chat it has on disk (id, folder), so a restart can resume it
     /// even when it was typed into a shell rather than started by chud
     pub resume: Option<(Agent, String, PathBuf)>,
+    /// what of that the state file last got, so a change is saved as it happens
+    saved_chat: String,
+    /// output came too soon after the last look at what is in front: look again shortly, as
+    /// that output may be the last for a while (an agent drawing its screen, then waiting)
+    probe_due: bool,
+    /// when the program last printed anything
+    heard: Instant,
     /// the agent a script or interpreter in front is running, read from its command line
     fg_script: Option<Agent>,
+    /// the chat named on the command line of the process in front, by its pid (see `typed_chat`)
+    typed: Option<(i32, Option<String>)>,
     /// when you last petted it, for the few seconds it looks pleased about it
     petted: Option<Instant>,
     /// you have given the agent in front something to do since it started. Codex spins its
@@ -410,6 +419,10 @@ impl Session {
             found: None,
             fg_since: std::time::SystemTime::now(),
             resume: None,
+            saved_chat: String::new(),
+            probe_due: false,
+            heard: Instant::now(),
+            typed: None,
             fg_script: None,
             petted: None,
             asked,
@@ -447,6 +460,7 @@ impl Session {
     /// The program printed something. For an agent that reports nothing itself, that may mean
     /// it started working.
     pub fn on_output(&mut self) {
+        self.heard = Instant::now();
         if self.agent == Agent::Codex && self.exit.is_none() {
             let parser = self.parser.clone();
             let mut p = parser.lock().unwrap();
@@ -564,9 +578,12 @@ impl Session {
         if reported.is_empty() { self.sid.clone() } else { reported.clone() }
     }
 
-    /// Re-checks which program is in front, at most once a second. True if it changed.
+    /// Re-checks which program is in front, at most once a second. True if it changed, or if
+    /// the chat of the agent in front isn't known yet: an agent writes down which chat it has
+    /// open a moment after it starts, so the first look can come too early.
     pub fn probe(&mut self) -> bool {
-        if self.exit.is_some() || self.probed.elapsed() < Duration::from_secs(1) {
+        self.probe_due = self.exit.is_none() && self.probed.elapsed() < Duration::from_secs(1);
+        if self.exit.is_some() || self.probe_due {
             return false;
         }
         self.probed = Instant::now();
@@ -588,15 +605,24 @@ impl Session {
             agent = script.clone();
         }
         if agent == self.agent {
-            return false;
+            let unknown = self.resume.is_none() && matches!(agent, Agent::Claude | Agent::Copilot);
+            // keep looking for a while after it last printed something, whether or not it prints
+            // more: /resume, say, draws the chat it switched to and then waits
+            self.probe_due = unknown && self.heard.elapsed() < Duration::from_secs(15);
+            return unknown;
+        }
+        // that agent is gone; the next one is found by refresh_usage. Unless it is the agent a
+        // restart reopened, coming to the front: it has that chat until it says otherwise
+        if !matches!(&self.resume, Some((a, ..)) if *a == agent) {
+            self.resume = None;
         }
         self.agent = agent;
-        self.resume = None; // that agent is gone; the next one is found by refresh_usage
         self.asked = false; // the Enter that started it was not a question for it
         let mut p = self.parser.lock().unwrap();
         let s = p.callbacks_mut();
-        s.chat.clear(); // a different program: the old chat name and summary no longer apply
+        s.chat.clear(); // a different program: the old chat's name, summary and id no longer apply
         s.summary.clear();
+        s.sid.clear();
         s.asking = false;
         true
     }
@@ -611,21 +637,33 @@ impl Session {
         // the running agent's own session, found by its pid: this also covers an agent
         // started by hand in a shell, where chud didn't choose the session id
         let home: Result<PathBuf, ()> = Ok(crate::config::home());
+        // looked up every time, not once: /resume switches chats under the same process
         let by_pid = match (self.fg_pid, &home) {
-            (Some(pid), Ok(home)) if copilot && self.found.is_none() => {
-                self.found = find_sid(home, &self.agent, pid).map(|(sid, _)| sid);
+            (Some(pid), Ok(home)) if copilot => {
+                self.found = find_sid(home, &self.agent, pid).map(|(sid, _)| sid).or(self.found.take());
                 None
             }
             (Some(pid), Ok(home)) if !copilot => find_sid(home, &self.agent, pid),
             _ => None,
         };
+        // nothing written down yet (it is still starting up): the chat its command line names
+        let typed = if by_pid.is_none() && !(copilot && self.found.is_some()) { self.typed_chat() } else { None };
         let (sid, found_cwd) = match (by_pid, &self.found) {
-            (Some((sid, cwd)), _) => (sid, cwd),
+            // Claude writes that file as it starts; after a /resume only the id it reports is current
+            (Some((sid, cwd)), _) => {
+                let reported = self.parser.lock().unwrap().callbacks().sid.clone();
+                (if reported.is_empty() { sid } else { reported }, cwd)
+            }
             (None, Some(sid)) if copilot => (sid.clone(), None),
-            _ => (self.agent_sid(), None),
+            _ => match self.agent_sid() {
+                reported if reported.is_empty() => (typed.unwrap_or_default(), None),
+                reported => (reported, None),
+            },
         };
         let agent_cwd = self.parser.lock().unwrap().callbacks().agent_cwd.clone();
+        // Copilot says nothing of its folder, and may have been started after a cd: ask the system
         let cwd = found_cwd
+            .or_else(|| self.fg_pid.filter(|_| copilot).and_then(proc_cwd))
             .or_else(|| Some(PathBuf::from(&agent_cwd)).filter(|_| !agent_cwd.is_empty()))
             .unwrap_or_else(|| self.cwd.clone());
         let kind = if copilot { usage::Kind::Copilot } else { usage::Kind::Claude };
@@ -641,6 +679,27 @@ impl Session {
             self.usage.context = used;
             self.usage.window = window;
         }
+    }
+
+    pub fn probe_due(&self) -> bool {
+        self.probe_due
+    }
+
+    /// True once each time the chat a restart would reopen changes.
+    pub fn chat_moved(&mut self) -> bool {
+        let now = format!("{} {:?}", self.agent_sid(), self.resume);
+        std::mem::replace(&mut self.saved_chat, now.clone()) != now
+    }
+
+    /// The chat the agent in front was told to open (`claude --resume <id>` typed into a shell),
+    /// read once per process: asking for a command line starts a process.
+    fn typed_chat(&mut self) -> Option<String> {
+        let pid = self.fg_pid?;
+        if self.typed.as_ref().is_none_or(|(p, _)| *p != pid) {
+            let args: Vec<String> = proc_args(pid).unwrap_or_default().split_whitespace().map(String::from).collect();
+            self.typed = Some((pid, resumed_id(&args)));
+        }
+        self.typed.as_ref()?.1.clone()
     }
 
     pub fn compacting(&self) -> bool {

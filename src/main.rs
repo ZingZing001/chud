@@ -507,7 +507,11 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
         // timing, wake once a second. Then drain and draw once.
         let ticking = app.dash
             || app.sessions.iter().any(|s| {
-                s.working_since.is_some() || s.status() == Status::NeedsInput || s.compacting() || s.petted()
+                s.working_since.is_some()
+                    || s.status() == Status::NeedsInput
+                    || s.compacting()
+                    || s.petted()
+                    || s.probe_due()
             });
         let first = if ticking { rx.recv_timeout(TICK).ok() } else { Some(rx.recv()?) };
         let mut dirty = first.is_some_and(|e| app.handle(e));
@@ -552,14 +556,12 @@ impl App {
         match ev {
             Event::Output(id) => match self.sessions.iter().position(|s| s.id == id) {
                 Some(i) => {
-                    let agent = self.sessions[i].probe();
-                    if agent {
-                        self.sessions[i].refresh_usage(); // a new agent in front: follow its usage
-                    }
+                    let agent = self.look_at(i);
                     self.sessions[i].on_output();
                     // the screen first: it can say the agent is waiting, which check_status reports
                     let shown = self.sessions[i].check_screen();
-                    let status = self.check_status(i);
+                    let status = self.check_status(i); // a turn ending re-reads which chat it is
+                    self.save_chat(i);
                     agent || status || shown || (i == self.sel && self.diff.is_none() && !self.dash)
                 }
                 None => false,
@@ -622,10 +624,36 @@ impl App {
         true
     }
 
+    /// What is in front of session `i` and which chat it has open. A new agent's usage is
+    /// followed from then on, and the chat is saved the moment it changes, not only when chud
+    /// quits: closing the window stops chud without it ever quitting. True if the agent changed.
+    fn look_at(&mut self, i: usize) -> bool {
+        let agent = self.sessions[i].probe();
+        if agent {
+            self.sessions[i].refresh_usage();
+        }
+        self.save_chat(i);
+        agent
+    }
+
+    /// Saves session `i` if the chat a restart would reopen changed. A new id from the agent
+    /// (it switched chats with /resume) is followed to that chat's folder first.
+    fn save_chat(&mut self, i: usize) {
+        let s = &mut self.sessions[i];
+        if s.chat_moved() {
+            s.refresh_usage();
+            s.chat_moved();
+            self.save();
+        }
+    }
+
     /// Once a second while something works or the summary is open: keep usage numbers fresh.
     fn tick(&mut self) {
         // agents that report nothing themselves: gone quiet after working means done
         for i in 0..self.sessions.len() {
+            if self.sessions[i].probe_due() && self.look_at(i) {
+                self.check_status(i);
+            }
             if self.sessions[i].on_tick() {
                 self.check_status(i);
             }
@@ -643,6 +671,9 @@ impl App {
             }
             self.refresh_plan();
             self.last_usage = Instant::now();
+        }
+        for i in 0..self.sessions.len() {
+            self.save_chat(i);
         }
     }
 
@@ -1310,11 +1341,13 @@ impl App {
             .iter()
             .map(|s| {
                 // an agent typed into a shell: the chat it has open, so a restart reopens it
-                let resume = s.resume.as_ref().filter(|(agent, ..)| *agent == s.agent).map(|(agent, sid, cwd)| {
+                let resume = s.resume.as_ref().map(|(agent, sid, cwd)| {
                     json!({ "agent": agent_name(agent).unwrap_or("claude"), "sid": sid, "cwd": cwd })
                 });
+                // a shell back at its prompt keeps the id of the chat it ran; that one is closed
+                let sid = if s.agent == Agent::Shell { String::new() } else { s.agent_sid() };
                 json!({ "argv": s.argv, "cwd": s.cwd, "name": s.name, "group": s.group,
-                        "sid": s.agent_sid(), "worked": s.worked().as_secs(), "resume": resume })
+                        "sid": sid, "worked": s.worked().as_secs(), "resume": resume })
             })
             .collect();
         let path = state_path();
@@ -1354,11 +1387,12 @@ impl App {
             let saved = usage::log_path(kind, sid, &cwd).is_some_and(|p| p.exists());
             let mut run = resume_argv(&argv, sid, saved);
             let mut cwd = cwd;
+            let mut reopened = None;
             // a terminal you ran claude or copilot in comes back running that chat again, in
             // the folder it was in, and leaves you at the prompt when you quit it
             // (state from before chud saved "resume" has only the chat id a warp-reporting claude
             // gave; its folder is read back from the transcript)
-            let old = match s.get("resume") {
+            let old = match s.get("resume").filter(|r| !r.is_null()) {
                 None if !sid.is_empty() => usage::claude_chat_cwd(&config::home(), sid)
                     .map(|dir| json!({ "agent": "claude", "sid": sid, "cwd": dir })),
                 _ => None,
@@ -1380,6 +1414,13 @@ impl App {
                 };
                 if let Some(argv) = again.filter(|_| on_disk) {
                     (run, cwd) = (argv, PathBuf::from(rcwd));
+                    // remembered from the start, so a save before the agent is looked at keeps it
+                    let agent = match agent {
+                        "copilot" => Agent::Copilot,
+                        "codex" => Agent::Codex,
+                        _ => Agent::Claude,
+                    };
+                    reopened = Some((agent, rsid.to_string(), cwd.clone()));
                 }
             }
             let group = s["group"].as_u64().unwrap_or(0) as usize;
@@ -1391,6 +1432,7 @@ impl App {
                 restored.name = s["name"].as_str().map(String::from);
                 restored.worked = Duration::from_secs(s["worked"].as_u64().unwrap_or(0));
                 restored.refresh_usage();
+                restored.resume = restored.resume.take().or(reopened);
             }
         }
         self.sel = self.visible().first().copied().unwrap_or(0);
