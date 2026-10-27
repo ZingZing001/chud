@@ -1927,8 +1927,8 @@ fn statusline() -> Result<()> {
 pub type Spot = (usize, u16);
 
 /// The text between two spots, the way you meant it rather than the way the agent drew it:
-/// without the scrollbar some agents keep in their last column, and without the spaces they
-/// pad each line with to paint its background. Lines scrolled out of sight are read by
+/// without the scrollbar some agents keep in their last column, the bar Copilot runs down the
+/// left of its thinking, or the spaces they pad each line with to paint its background. Lines scrolled out of sight are read by
 /// scrolling back to them, then the view goes back where it was.
 fn picked_text(screen: &mut vt100::Screen, (l1, c1): Spot, (l2, c2): Spot) -> String {
     let (rows, back) = (screen.size().0, screen.scrollback());
@@ -1939,6 +1939,7 @@ fn picked_text(screen: &mut vt100::Screen, (l1, c1): Spot, (l2, c2): Spot) -> St
         screen.set_scrollback(top);
         let r = u16::try_from(usize::from(rows) - 1 - (line - screen.scrollback())).unwrap_or(0);
         let from = if line == l1 { c1 } else { 0 };
+        let from = if from < 3 && gutter(screen, r) { 3 } else { from };
         let to = if line == l2 { c2 + 1 } else { cols }.min(cols);
         text += &screen.rows(from, to.saturating_sub(from)).nth(r.into()).unwrap_or_default();
         if line > l2 && !screen.row_wrapped(r) {
@@ -1947,6 +1948,13 @@ fn picked_text(screen: &mut vt100::Screen, (l1, c1): Spot, (l2, c2): Spot) -> St
     }
     screen.set_scrollback(back);
     text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
+}
+
+/// A row Copilot drew in its thinking block: " │ " ahead of the text. Exactly that, so a tree
+/// (`│   ├── src`) or a table, which start at the edge or further in, are copied whole.
+fn gutter(screen: &vt100::Screen, r: u16) -> bool {
+    let at = |c| screen.cell(r, c).map(|c| c.contents()).unwrap_or_default();
+    at(0).trim().is_empty() && at(1) == "│" && at(2).trim().is_empty()
 }
 
 /// The last column, when it holds a scrollbar rather than text: nothing in it but blanks and
@@ -2153,6 +2161,14 @@ mod tests {
         p.screen_mut().set_scrollback(1); // scrolled up while dragging
         assert_eq!(picked_text(p.screen_mut(), (6, 0), (0, 19)), "one\ntwo\nthree\nfour\nfive\nsix\nseven");
         assert_eq!(p.screen().scrollback(), 1, "the view stays where you left it");
+    }
+
+    #[test]
+    fn copilots_thinking_comes_without_its_bar() {
+        let mut p = screen_of(&[" ⌄ Thought for 1s", " │ 1001 is 7 × 11", " │ × 13.", " ● Not prime.", "│   └── src", "  │ kept"]);
+        let all = picked_text(p.screen_mut(), (5, 0), (0, 19));
+        assert_eq!(all, " ⌄ Thought for 1s\n1001 is 7 × 11\n× 13.\n ● Not prime.\n│   └── src\n  │ kept");
+        assert_eq!(picked_text(p.screen_mut(), (4, 1), (4, 19)), "1001 is 7 × 11", "a drag starting on the bar");
     }
 
     #[test]
