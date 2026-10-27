@@ -19,6 +19,7 @@ use crossterm::execute;
 use ratatui::layout::Rect;
 use serde_json::{json, Value};
 use session::{Agent, Event, Session, Status};
+use std::cmp::Reverse;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -367,8 +368,9 @@ struct App {
     hover: Option<Hit>,
     /// mouse reporting off so the terminal can select text (C-a v, or holding ⌥)
     select: bool,
-    /// dragging over the terminal selects its text: (anchor, cursor), both screen cells
-    picked: Option<((u16, u16), (u16, u16))>,
+    /// dragging over the terminal selects its text: (anchor, cursor), held to the text rather
+    /// than the screen so it stays put while you scroll
+    picked: Option<(Spot, Spot)>,
     /// sidebar width parked here while the terminal is zoomed (C-a f)
     zoom: Option<u16>,
     /// the window changed size: repaint every cell, not just the ones that differ
@@ -1513,7 +1515,10 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 match hit {
-                    Some(Hit::Pane(i)) => self.to_pane(m, i), // scrolls that pane, focused or not
+                    Some(Hit::Pane(i)) => {
+                        self.to_pane(m, i); // scrolls that pane, focused or not
+                        self.follow(m); // and a selection being dragged keeps up with it
+                    }
                     Some(Hit::Cards | Hit::Card(_)) => {
                         self.dash_scroll = if up { self.dash_scroll.saturating_sub(1) } else { self.dash_scroll + 1 }
                     }
@@ -1704,7 +1709,7 @@ impl App {
                 }
                 // where a selection would start; a press that never moves is just a click,
                 // and the agent gets it either way
-                self.picked = Some(((m.column, m.row), (m.column, m.row)));
+                self.picked = self.spot(m.column, m.row).map(|at| (at, at));
                 self.drag = Some(Drag { from: Hit::Pane(i), at: (m.column, m.row), moved: false });
                 self.to_pane(m, i);
             }
@@ -1722,8 +1727,11 @@ impl App {
             _ if !d.moved => {}
             Hit::Edge => self.side = (m.column + 1).clamp(24, (self.size.0 / 2).max(24)),
             // dragging over the terminal selects its text rather than reaching the agent
-            Hit::Pane(i) => match &mut self.picked {
-                Some((_, to)) => *to = (m.column, m.row),
+            Hit::Pane(i) => match self.picked {
+                Some(_) => {
+                    self.scroll_past_edge(m.row);
+                    self.follow(m);
+                }
                 None => self.to_pane(m, i),
             },
             // the panes follow the divider as you drag; terminals are resized once you let go
@@ -1807,25 +1815,54 @@ impl App {
         }
     }
 
-    /// What the drag covered, in the agent's own screen coordinates, ordered from the earlier
-    /// cell to the later one.
-    fn picked_cells(&self) -> Option<((u16, u16), (u16, u16))> {
-        let (anchor, to) = self.picked?;
+    /// The spot in the focused session's text under a window cell, clamped to its pane.
+    fn spot(&self, x: u16, y: u16) -> Option<Spot> {
         let pane = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel))?.0; // the focused pane: drags start there
-        let cell = |(x, y): (u16, u16)| {
-            (y.clamp(pane.y, pane.bottom() - 1) - pane.y, x.clamp(pane.x, pane.right() - 1) - pane.x)
-        };
-        let (a, b) = (cell(anchor), cell(to));
-        (a != b).then(|| if a < b { (a, b) } else { (b, a) }) // a press that never moved is a click
+        let p = self.sessions.get(self.sel)?.parser.lock().unwrap();
+        let (rows, back) = (p.screen().size().0, p.screen().scrollback());
+        let row = y.clamp(pane.y, pane.bottom() - 1) - pane.y;
+        Some((back + usize::from(rows.saturating_sub(row + 1)), x.clamp(pane.x, pane.right() - 1) - pane.x))
+    }
+
+    /// Moves the dragged end of a selection to the mouse.
+    fn follow(&mut self, m: MouseEvent) {
+        if !matches!(self.drag, Some(Drag { from: Hit::Pane(_), .. })) {
+            return;
+        }
+        let at = self.spot(m.column, m.row);
+        if let (Some((_, to)), Some(at)) = (self.picked.as_mut(), at) {
+            *to = at;
+        }
+    }
+
+    /// Dragging a selection above or below the pane scrolls the text under it, a line per
+    /// mouse move, so a selection can be longer than the pane.
+    // ponytail: scrolls only while the mouse moves; a timer would keep it going when held still
+    fn scroll_past_edge(&mut self, y: u16) {
+        let Some(&(pane, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel)) else { return };
+        let Some(s) = self.sessions.get(self.sel) else { return };
+        let mut p = s.parser.lock().unwrap();
+        let back = p.screen().scrollback();
+        match y {
+            _ if y < pane.y => p.screen_mut().set_scrollback(back + 1),
+            _ if y >= pane.bottom() => p.screen_mut().set_scrollback(back.saturating_sub(1)),
+            _ => {}
+        }
+    }
+
+    /// What the drag covered, the earlier spot first; None for a press that never moved.
+    pub fn picked_cells(&self) -> Option<(Spot, Spot)> {
+        let (a, b) = self.picked?;
+        (a != b).then(|| if (Reverse(a.0), a.1) < (Reverse(b.0), b.1) { (a, b) } else { (b, a) })
     }
 
     /// Copies the dragged-over text. The selection stays lit so you can see what you got.
     fn copy_picked(&mut self) {
-        let (Some(((r1, c1), (r2, c2))), Some(s)) = (self.picked_cells(), self.sessions.get(self.sel)) else {
+        let (Some((from, to)), Some(s)) = (self.picked_cells(), self.sessions.get(self.sel)) else {
             self.flash = Some(" nothing selected · drag over the terminal first ".into());
             return;
         };
-        let text = s.parser.lock().unwrap().screen().contents_between(r1, c1, r2, c2 + 1);
+        let text = picked_text(s.parser.lock().unwrap().screen_mut(), from, to);
         self.flash = match (text.is_empty(), copy_to_clipboard(&text)) {
             (true, _) => None,
             (_, Ok(())) => Some(format!(" copied {} characters to the clipboard ", text.chars().count())),
@@ -1885,6 +1922,51 @@ fn statusline() -> Result<()> {
 
 /// Puts text on the system clipboard with whatever this platform provides: pbcopy on macOS,
 /// PowerShell on Windows (reading UTF-8, so non-ASCII survives), wl-copy or xclip on Linux.
+/// A place in a session's text: (lines above the bottom of the screen, column). Counting from
+/// the bottom keeps it on the same text however far back you've scrolled.
+pub type Spot = (usize, u16);
+
+/// The text between two spots, the way you meant it rather than the way the agent drew it:
+/// without the scrollbar some agents keep in their last column, and without the spaces they
+/// pad each line with to paint its background. Lines scrolled out of sight are read by
+/// scrolling back to them, then the view goes back where it was.
+fn picked_text(screen: &mut vt100::Screen, (l1, c1): Spot, (l2, c2): Spot) -> String {
+    let (rows, back) = (screen.size().0, screen.scrollback());
+    let cols = scrollbar_col(screen).unwrap_or(screen.size().1);
+    let mut text = String::new();
+    for line in (l2..=l1).rev() {
+        let top = line.saturating_sub(usize::from(rows) - 1); // the least scrolling that shows it
+        screen.set_scrollback(top);
+        let r = u16::try_from(usize::from(rows) - 1 - (line - screen.scrollback())).unwrap_or(0);
+        let from = if line == l1 { c1 } else { 0 };
+        let to = if line == l2 { c2 + 1 } else { cols }.min(cols);
+        text += &screen.rows(from, to.saturating_sub(from)).nth(r.into()).unwrap_or_default();
+        if line > l2 && !screen.row_wrapped(r) {
+            text.push('\n');
+        }
+    }
+    screen.set_scrollback(back);
+    text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
+}
+
+/// The last column, when it holds a scrollbar rather than text: nothing in it but blanks and
+/// box-drawing, with a few vertical bars or blocks. ASCII `|` never counts, so a shell pipe or
+/// a table that reaches the edge stays.
+fn scrollbar_col(screen: &vt100::Screen) -> Option<u16> {
+    let (rows, cols) = screen.size();
+    let last = cols.checked_sub(1)?;
+    let mut bars = 0;
+    for r in 0..rows {
+        let cell = screen.cell(r, last).map(|c| c.contents()).unwrap_or_default();
+        match cell.chars().next() {
+            None | Some(' ') => {}
+            Some(c @ '\u{2500}'..='\u{259f}') => bars += "│┃║╎╏┆┇┊┋▌▐█░▒▓▕▏".contains(c) as u16,
+            Some(_) => return None,
+        }
+    }
+    (bars >= 3).then_some(last)
+}
+
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     let windows = "[Console]::InputEncoding = [Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())";
     let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
@@ -2045,6 +2127,43 @@ mod tests {
 
     fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
+    }
+
+    fn screen_of(rows: &[&str]) -> vt100::Parser {
+        let mut p = vt100::Parser::new(rows.len() as u16, 20, 0);
+        for (r, row) in rows.iter().enumerate() {
+            p.process(format!("\x1b[{};1H{row}", r + 1).as_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn copying_leaves_the_scrollbar_and_padding_behind() {
+        let p = screen_of(&["fn main() {        █", "    run();         █", "}                  │", "                   │"]);
+        let mut p = p;
+        assert_eq!(picked_text(p.screen_mut(), (3, 0), (1, 19)), "fn main() {\n    run();\n}");
+        // part of a line, the way a drag that starts mid-row gets it
+        assert_eq!(picked_text(p.screen_mut(), (2, 4), (2, 19)), "run();");
+    }
+
+    #[test]
+    fn a_selection_can_be_longer_than_the_pane() {
+        let mut p = vt100::Parser::new(4, 20, 100);
+        p.process(b"one  \r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven");
+        p.screen_mut().set_scrollback(1); // scrolled up while dragging
+        assert_eq!(picked_text(p.screen_mut(), (6, 0), (0, 19)), "one\ntwo\nthree\nfour\nfive\nsix\nseven");
+        assert_eq!(p.screen().scrollback(), 1, "the view stays where you left it");
+    }
+
+    #[test]
+    fn text_in_the_last_column_is_never_a_scrollbar() {
+        let p = screen_of(&["ls | grep x        |", "a long line reaching", "                   │", "                   │"]);
+        assert_eq!(scrollbar_col(p.screen()), None);
+        let mut p = p;
+        assert_eq!(picked_text(p.screen_mut(), (3, 0), (2, 19)), "ls | grep x        |\na long line reaching");
+        // a box's right edge alone isn't enough to call it a scrollbar
+        let boxed = screen_of(&["╭──────────────────╮", "│ Do you want it? │", "╰──────────────────╯", "                    "]);
+        assert_eq!(scrollbar_col(boxed.screen()), None);
     }
 
     #[test]

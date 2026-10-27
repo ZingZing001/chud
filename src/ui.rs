@@ -340,9 +340,10 @@ fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
         // the cursor shows only where your typing goes
         let cursor = Cursor::default().visibility(i == app.sel && !screen.hide_cursor() && screen.scrollback() == 0);
         f.render_widget(PseudoTerminal::new(screen).cursor(cursor), term);
+        let back = screen.scrollback();
         drop(p);
         if i == app.sel {
-            picked(f, app, term);
+            picked(f, app, term, back);
         }
         hits.push((term, Hit::Pane(i)));
     }
@@ -710,13 +711,18 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
 }
 
 /// Lights up the cells a drag covered, the way any terminal shows a selection: from the first
-/// cell to the last in reading order, not as a rectangle.
-fn picked(f: &mut Frame, app: &App, term: Rect) {
-    let Some(((r1, c1), (r2, c2))) = app.picked_cells() else { return };
+/// cell to the last in reading order, not as a rectangle. The selection belongs to the text, so
+/// it scrolls with it.
+fn picked(f: &mut Frame, app: &App, term: Rect, back: usize) {
+    let Some(((l1, c1), (l2, c2))) = app.picked_cells() else { return };
     let buf = f.buffer_mut();
-    for row in r1..=r2.min(term.height.saturating_sub(1)) {
-        let from = if row == r1 { c1 } else { 0 };
-        let to = if row == r2 { c2 } else { term.width.saturating_sub(1) };
+    for row in 0..term.height {
+        let line = back + usize::from(term.height - 1 - row);
+        if line > l1 || line < l2 {
+            continue;
+        }
+        let from = if line == l1 { c1 } else { 0 };
+        let to = if line == l2 { c2 } else { term.width.saturating_sub(1) };
         for col in from..=to.min(term.width.saturating_sub(1)) {
             buf[(term.x + col, term.y + row)].set_style(Style::new().add_modifier(Modifier::REVERSED));
         }
@@ -906,7 +912,7 @@ fn menu(f: &mut Frame, m: &Menu, hits: &mut Hits) {
 const HELP: &[(&str, &str)] = &[
     ("click", "select a session · … opens its menu · a group header folds it"),
     ("drag", "a session onto another session or a group to move it"),
-    ("drag in the terminal", "select text; letting go copies it"),
+    ("drag in the terminal", "select text, scrolling past the edge for more; letting go copies it"),
     ("drag edge", "the sidebar's right edge to resize it"),
     ("toolbar", "+ New (terminal or group) · Dashboard · Diff · Help"),
     ("C-a n", "new terminal (zsh) in this group"),
