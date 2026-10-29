@@ -27,6 +27,43 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const FRAME: Duration = Duration::from_millis(16);
+/// The gap between frames while you are only watching programs print. Every frame costs
+/// chud.app a redraw of the whole window, and streaming output reads no worse at 30 a second.
+/// For a moment after you type or click it is 60 again, so the echo of a key isn't held back.
+const OUTPUT_FRAME: Duration = Duration::from_millis(33);
+const TYPING: Duration = Duration::from_millis(500);
+
+/// chud's terminal: frames go out through `Frames`, and the size is set by resize events rather
+/// than asked of the terminal before every frame (crossterm opens /dev/tty to ask).
+type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<Frames>>;
+
+/// Holds a frame until ratatui flushes at its end, then sends it in one write between
+/// "synchronized update" marks (DEC mode 2026): the terminal shows the frame whole, and
+/// chud.app, which redraws every cell each time output arrives, redraws once per frame instead
+/// of once per piece. Terminals that don't know the mode ignore it.
+#[derive(Default)]
+struct Frames(Vec<u8>);
+
+impl Write for Frames {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.is_empty() {
+            self.0.extend_from_slice(b"\x1b[?2026h");
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        self.0.extend_from_slice(b"\x1b[?2026l");
+        let mut out = stdout().lock();
+        let sent = out.write_all(&self.0).and_then(|_| out.flush());
+        self.0.clear();
+        sent
+    }
+}
 const TICK: Duration = Duration::from_secs(1);
 const SIDE: u16 = 38;
 const DEFAULT_CMD: &str = if cfg!(windows) { "powershell" } else { "zsh" }; // what a new terminal runs
@@ -395,7 +432,10 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--statusline") {
         return statusline();
     }
-    let mut term = ratatui::init();
+    let _ = ratatui::init(); // raw mode, the alternate screen, and putting both back on a panic
+    let (w, h) = crossterm::terminal::size()?;
+    let viewport = ratatui::Viewport::Fixed(Rect::new(0, 0, w, h));
+    let mut term = Term::with_options(ratatui::backend::CrosstermBackend::new(Frames::default()), ratatui::TerminalOptions { viewport })?;
     // Also switch off "alternate scroll" (mode 1007): with it, some terminals (chud.app's among
     // them) turn the wheel into Up/Down arrow keys in full-screen apps, which reached the agent.
     use crossterm::style::Print;
@@ -414,7 +454,7 @@ fn main() -> Result<()> {
     res
 }
 
-fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
+fn run(term: &mut Term) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let input_tx = tx.clone();
     std::thread::spawn(move || {
@@ -465,7 +505,10 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     while app.size.1 < 10 {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
         match rx.recv_timeout(left) {
-            Ok(Event::Input(Input::Resize(w, h))) => app.size = (w, h),
+            Ok(Event::Input(Input::Resize(w, h))) => {
+                app.size = (w, h);
+                term.resize(Rect::new(0, 0, w, h))?;
+            }
             Ok(_) => {}
             Err(_) => break,
         }
@@ -502,6 +545,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
     term.draw(|f| hits = ui::draw(f, &app))?;
     app.hits = hits;
     let mut last = Instant::now();
+    let mut last_input = Instant::now().checked_sub(TYPING).unwrap_or_else(Instant::now);
     loop {
         // Block until something happens (idle = no wakeups); while something is animating or
         // timing, wake once a second. Then drain and draw once.
@@ -514,9 +558,14 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
                     || s.probe_due()
             });
         let first = if ticking { rx.recv_timeout(TICK).ok() } else { Some(rx.recv()?) };
+        let mut typed = matches!(first, Some(Event::Input(_)));
         let mut dirty = first.is_some_and(|e| app.handle(e));
         while let Ok(e) = rx.try_recv() {
+            typed |= matches!(e, Event::Input(_));
             dirty |= app.handle(e);
+        }
+        if typed {
+            last_input = Instant::now();
         }
         if app.quit {
             app.save();
@@ -530,12 +579,12 @@ fn run(term: &mut ratatui::DefaultTerminal) -> Result<()> {
             if std::mem::take(&mut app.resized) {
                 // Not Terminal::clear(): that asks the terminal where the cursor is, and the
                 // reply goes to the thread reading input, so it times out and takes chud down
-                // with it. Wipe the screen, then blank what ratatui believes is on it with one
-                // throwaway frame, so the real frame after it draws every cell.
-                execute!(stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
-                term.draw(|f| f.render_widget(ratatui::widgets::Clear, f.area()))?;
+                // with it. resize() on a fixed viewport blanks it and forgets the old frame, so
+                // the next one draws every cell.
+                term.resize(Rect::new(0, 0, app.size.0, app.size.1))?;
             }
-            let wait = FRAME.saturating_sub(last.elapsed());
+            let gap = if last_input.elapsed() < TYPING { FRAME } else { OUTPUT_FRAME };
+            let wait = gap.saturating_sub(last.elapsed());
             if !wait.is_zero() {
                 std::thread::sleep(wait);
                 while let Ok(e) = rx.try_recv() {
@@ -556,6 +605,7 @@ impl App {
         match ev {
             Event::Output(id) => match self.sessions.iter().position(|s| s.id == id) {
                 Some(i) => {
+                    self.sessions[i].output_seen(); // before reading it: newer output sends a new event
                     let agent = self.look_at(i);
                     self.sessions[i].on_output();
                     // the screen first: it can say the agent is waiting, which check_status reports

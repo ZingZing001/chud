@@ -278,6 +278,9 @@ pub struct Session {
     pub resume: Option<(Agent, String, PathBuf)>,
     /// what of that the state file last got, so a change is saved as it happens
     saved_chat: String,
+    /// set by the reader when it sends an Output event, cleared when chud handles it, so a burst
+    /// of output is one event rather than one per read
+    unseen: Arc<std::sync::atomic::AtomicBool>,
     /// output came too soon after the last look at what is in front: look again shortly, as
     /// that output may be the last for a while (an agent drawing its screen, then waiting)
     probe_due: bool,
@@ -381,6 +384,8 @@ impl Session {
             Signals::default(),
         )));
         let (p, w) = (parser.clone(), writer.clone());
+        let unseen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = unseen.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             while let Ok(n @ 1..) = reader.read(&mut buf) {
@@ -392,7 +397,9 @@ impl Session {
                 if !reply.is_empty() {
                     let _ = w.send(reply);
                 }
-                if tx.send(Event::Output(id)).is_err() {
+                // one wake-up at a time: until chud has looked, more output needs no new event
+                let first = !waiting.swap(true, std::sync::atomic::Ordering::AcqRel);
+                if first && tx.send(Event::Output(id)).is_err() {
                     return;
                 }
             }
@@ -421,6 +428,7 @@ impl Session {
             resume: None,
             saved_chat: String::new(),
             probe_due: false,
+            unseen,
             heard: Instant::now(),
             typed: None,
             fg_script: None,
@@ -679,6 +687,11 @@ impl Session {
             self.usage.context = used;
             self.usage.window = window;
         }
+    }
+
+    /// chud is about to look at this session's output; anything printed after this is news.
+    pub fn output_seen(&self) {
+        self.unseen.store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub fn probe_due(&self) -> bool {
