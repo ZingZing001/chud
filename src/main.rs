@@ -379,6 +379,105 @@ fn kind_of(agent: &str) -> usage::Kind {
     }
 }
 
+/// One saved session, and how it comes back.
+#[derive(Debug, PartialEq)]
+struct Reopen {
+    /// how the session was first started, kept as its identity
+    argv: Vec<String>,
+    /// what to run now: that, or the chat it had open
+    run: Vec<String>,
+    cwd: PathBuf,
+    /// the chat `run` reopens, remembered from the start so a save before the agent is looked
+    /// at keeps it
+    chat: Option<(Agent, String, PathBuf)>,
+    group: usize,
+    name: Option<String>,
+    worked: u64,
+    /// its chat is already open in an earlier session, so this one starts fresh instead: two
+    /// agents writing one transcript corrupt it
+    double: bool,
+}
+
+/// Works out, for each saved session in order, what to start (None for an entry too broken to
+/// start anything). Nothing is started here, so it can be tested: `on_disk` says whether a
+/// chat's log exists, `chat_cwd` finds the folder of a Claude chat known only by its id.
+fn restore_plan(
+    v: &Value,
+    on_disk: &dyn Fn(usage::Kind, &str, &Path) -> bool,
+    chat_cwd: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Vec<Option<Reopen>> {
+    let groups: Vec<u64> = v["groups"].as_array().into_iter().flatten().filter_map(|g| g["id"].as_u64()).collect();
+    let mut open = std::collections::HashSet::new(); // chats some earlier session reopens
+    let saved = v["sessions"].as_array().into_iter().flatten();
+    saved
+        .map(|s| {
+            let argv: Vec<String> =
+                s["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect();
+            let (prog, cwd) = (argv.first()?.clone(), PathBuf::from(s["cwd"].as_str()?));
+            let sid = s["sid"].as_str().unwrap_or_default();
+            let kind = if session::agent_of(&prog) == Agent::Copilot { usage::Kind::Copilot } else { usage::Kind::Claude };
+            let mut run = resume_argv(&argv, sid, on_disk(kind, sid, &cwd));
+            let mut chat_id = (run != argv).then(|| sid.to_string());
+            let (mut cwd, mut chat) = (cwd, None);
+            // a terminal you ran claude or copilot in comes back running that chat again, in
+            // the folder it was in, and leaves you at the prompt when you quit it
+            // (state from before chud saved "resume" has only the chat id a warp-reporting claude
+            // gave; its folder is read back from the transcript)
+            let old = match s.get("resume").filter(|r| !r.is_null()) {
+                None if !sid.is_empty() => chat_cwd(sid).map(|dir| json!({ "agent": "claude", "sid": sid, "cwd": dir })),
+                _ => None,
+            };
+            let r = old.as_ref().unwrap_or(&s["resume"]);
+            if let (Some(agent), Some(rsid), Some(rcwd)) = (r["agent"].as_str(), r["sid"].as_str(), r["cwd"].as_str()) {
+                // a terminal gets the chat back inside its shell; a session that *was* the agent
+                // (codex, whose id chud only learns afterwards) is started as that chat directly
+                let again = match session::agent_of(&prog) {
+                    Agent::Shell => resume_in_shell(&argv, agent, rsid),
+                    started if agent_name(&started) == Some(agent) => {
+                        resume_words(agent, rsid).map(|mut w| {
+                            w[0] = prog.clone(); // keep how it was started: a full path, say
+                            w
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(again) = again.filter(|_| on_disk(kind_of(agent), rsid, Path::new(rcwd))) {
+                    (run, cwd, chat_id) = (again, PathBuf::from(rcwd), Some(rsid.to_string()));
+                    let agent = match agent {
+                        "copilot" => Agent::Copilot,
+                        "codex" => Agent::Codex,
+                        _ => Agent::Claude,
+                    };
+                    chat = Some((agent, rsid.to_string(), cwd.clone()));
+                }
+            }
+            let double = chat_id.is_some_and(|id| !open.insert(id));
+            if double {
+                (run, chat) = (argv.clone(), None);
+                cwd = PathBuf::from(s["cwd"].as_str()?);
+            }
+            let group = s["group"].as_u64().filter(|g| groups.contains(g)).unwrap_or(0) as usize;
+            let name = s["name"].as_str().map(String::from);
+            Some(Reopen { argv, run, cwd, chat, group, name, worked: s["worked"].as_u64().unwrap_or(0), double })
+        })
+        .collect()
+}
+
+/// Claims the saved state for this chud by writing its pid to `lock`. False if the chud named
+/// there is still running: two of them restoring the same sessions would each resume the same
+/// chats, and then save over each other. A pid left by a chud that died is not a claim, and
+/// neither is one the system has since given to some other program.
+fn claim_state(lock: &Path) -> bool {
+    let holder = std::fs::read_to_string(lock).ok().and_then(|t| t.trim().parse::<i32>().ok());
+    let me = std::process::id() as i32;
+    let chud = |pid: i32| session::proc_path(pid).is_some_and(|p| p.rsplit('/').next() == Some("chud"));
+    if holder.is_some_and(|pid| pid != me && chud(pid)) {
+        return false;
+    }
+    config::write_atomic(lock, &me.to_string());
+    true
+}
+
 fn state_path() -> PathBuf {
     config::home().join(".config/chud/state.json")
 }
@@ -419,6 +518,9 @@ struct App {
     /// no theme was chosen, so chud.app may switch it when the system does
     theme_follows: bool,
     setup: Option<Setup>,
+    /// another chud is already running from this home: this one neither restores the saved
+    /// sessions (they are open over there) nor saves over them
+    guest: bool,
     /// which sessions are on screen, and how the main area is split between them
     layout: layout::Node,
     /// where a session dragged out of the sidebar would land: (pane's session, zone)
@@ -445,6 +547,10 @@ fn main() -> Result<()> {
     execute!(stdout(), ct::EnableMouseCapture, ct::EnableBracketedPaste, ct::EnableFocusChange, Print("\x1b[?1007l"))?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // a session's terminal giving up is caught and ends that session; the screen is still ours
+        if std::thread::current().name() == Some(session::READER) {
+            return;
+        }
         let _ = modes();
         hook(info);
     }));
@@ -465,40 +571,7 @@ fn run(term: &mut Term) -> Result<()> {
         }
     });
     let size = term.size()?;
-    let mut app = App {
-        sessions: vec![],
-        groups: vec![Group { id: 0, name: "ungrouped".into(), collapsed: false }],
-        sel: 0,
-        prefix: false,
-        prompt: None,
-        diff: None,
-        dash: false,
-        dash_scroll: 0,
-        help: false,
-        menu: None,
-        focused: true,
-        quit: false,
-        next_id: 0,
-        next_gid: 0,
-        size: (size.width, size.height),
-        side: SIDE,
-        hits: vec![],
-        drag: None,
-        hover: None,
-        select: false,
-        picked: None,
-        zoom: None,
-        resized: false,
-        flash: None,
-        update: None,
-        theme_follows: true,
-        setup: None,
-        layout: layout::Node::Leaf(0),
-        drop: None,
-        last_usage: Instant::now(),
-        plan: usage::Plan::default(),
-        tx,
-    };
+    let mut app = App::new((size.width, size.height), tx);
     // chud.app starts us before its window has a size; wait briefly for the real one so the
     // first sessions don't start (and wrap their first output) in a tiny terminal
     let deadline = Instant::now() + Duration::from_millis(1500);
@@ -514,6 +587,7 @@ fn run(term: &mut Term) -> Result<()> {
         }
     }
     let cfg = config::load();
+    usage::prune_contexts();
     agents::init(&cfg); // before any session is classified
     let var = |k| std::env::var(k).ok();
     let mascot = config::setting(&cfg, "mascot", "CHUD_MASCOT");
@@ -526,8 +600,12 @@ fn run(term: &mut Term) -> Result<()> {
     for cmd in &args {
         app.open(cmd);
     }
-    if args.is_empty() {
+    app.guest = !claim_state(&config::home().join(".config/chud/chud.lock"));
+    if args.is_empty() && !app.guest {
         app.restore();
+    }
+    if app.guest {
+        app.flash = Some(" another chud is running: your saved sessions stay with it, and this one won't be saved ".into());
     }
     if app.sessions.is_empty() {
         app.open(DEFAULT_CMD); // like any terminal app: start with a shell
@@ -600,6 +678,44 @@ fn run(term: &mut Term) -> Result<()> {
 }
 
 impl App {
+    fn new(size: (u16, u16), tx: mpsc::Sender<Event>) -> App {
+        App {
+            sessions: vec![],
+            groups: vec![Group { id: 0, name: "ungrouped".into(), collapsed: false }],
+            sel: 0,
+            prefix: false,
+            prompt: None,
+            diff: None,
+            dash: false,
+            dash_scroll: 0,
+            help: false,
+            menu: None,
+            focused: true,
+            quit: false,
+            next_id: 0,
+            next_gid: 0,
+            size,
+            side: SIDE,
+            hits: vec![],
+            drag: None,
+            hover: None,
+            select: false,
+            picked: None,
+            zoom: None,
+            resized: false,
+            flash: None,
+            update: None,
+            theme_follows: true,
+            setup: None,
+            guest: false,
+            layout: layout::Node::Leaf(0),
+            drop: None,
+            last_usage: Instant::now(),
+            plan: usage::Plan::default(),
+            tx,
+        }
+    }
+
     /// Returns true when the screen needs a redraw.
     fn handle(&mut self, ev: Event) -> bool {
         match ev {
@@ -827,7 +943,7 @@ impl App {
         }
         let mut answered = false;
         if let Some(s) = self.sessions.get_mut(self.sel) {
-            let mut p = s.parser.lock().unwrap();
+            let mut p = s.parser.lock();
             p.screen_mut().set_scrollback(0);
             let bytes = key_bytes(k, p.screen().application_cursor());
             drop(p);
@@ -919,7 +1035,7 @@ impl App {
     /// is the slower way to get at it.
     fn copy_screen(&mut self) {
         let Some(s) = self.sessions.get(self.sel) else { return };
-        let text = s.parser.lock().unwrap().screen().contents();
+        let text = s.parser.lock().screen().contents();
         let lines = text.lines().count();
         self.flash = match copy_to_clipboard(&text) {
             Ok(()) => Some(format!(" copied {lines} lines to the clipboard ")),
@@ -1032,6 +1148,7 @@ impl App {
         match ask {
             Ask::Kill if self.sel < self.sessions.len() => {
                 let id = self.sessions.remove(self.sel).id; // Drop kills the child
+                self.stale();
                 self.layout.remove(id);
                 self.select(self.sel.min(self.sessions.len().saturating_sub(1)));
                 self.save();
@@ -1207,7 +1324,12 @@ impl App {
     }
 
     fn spawn(&mut self, argv: Vec<String>, cwd: PathBuf, group: usize) -> Option<usize> {
-        let mut s = Session::spawn(self.next_id, argv, cwd, self.pane(), self.tx.clone()).ok()?;
+        self.spawn_after(argv, cwd, group, Duration::ZERO)
+    }
+
+    /// Starts a session whose program waits `delay` before it runs (see `restore`).
+    fn spawn_after(&mut self, argv: Vec<String>, cwd: PathBuf, group: usize, delay: Duration) -> Option<usize> {
+        let mut s = Session::spawn(self.next_id, argv, cwd, self.pane(), self.tx.clone(), delay).ok()?;
         s.group = group;
         self.next_id += 1;
         self.sessions.push(s);
@@ -1323,6 +1445,7 @@ impl App {
         };
         if let Some(j) = other {
             self.sessions.swap(self.sel, j);
+            self.stale();
             self.sel = j;
             self.save();
         }
@@ -1351,6 +1474,7 @@ impl App {
             return;
         }
         let id = self.groups.remove(gi).id;
+        self.stale();
         for s in self.sessions.iter_mut().filter(|s| s.group == id) {
             s.group = 0;
         }
@@ -1361,12 +1485,15 @@ impl App {
     /// (joins that group), or onto empty sidebar space (ungrouped).
     fn drop_session(&mut self, i: usize, target: Option<Hit>) {
         let selected = self.sessions.get(self.sel).map(|s| s.id);
+        if i >= self.sessions.len() {
+            return;
+        }
         match target {
-            Some(Hit::Session(j)) if j != i => {
+            Some(Hit::Session(j)) if j != i && j < self.sessions.len() => {
                 self.sessions[i].group = self.sessions[j].group;
                 move_item(&mut self.sessions, i, Some(j));
             }
-            Some(Hit::Group(gi)) => {
+            Some(Hit::Group(gi)) if gi < self.groups.len() => {
                 self.sessions[i].group = self.groups[gi].id;
                 move_item(&mut self.sessions, i, None);
             }
@@ -1376,11 +1503,15 @@ impl App {
             }
             _ => return,
         }
+        self.stale();
         self.sel = selected.and_then(|id| self.sessions.iter().position(|s| s.id == id)).unwrap_or(0);
         self.save();
     }
 
     fn save(&self) {
+        if self.guest {
+            return; // the saved state belongs to the chud that was here first
+        }
         let groups: Vec<Value> = self
             .groups
             .iter()
@@ -1401,10 +1532,11 @@ impl App {
             })
             .collect();
         let path = state_path();
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
         let layout = self.layout.to_json(&|id| self.sessions.iter().position(|s| s.id == id));
         let state = json!({ "side": self.zoom.unwrap_or(self.side), "groups": groups, "sessions": sessions, "layout": layout });
-        let _ = std::fs::write(&path, state.to_string());
+        // in one step: this runs every time a chat changes, and a state file cut off halfway
+        // would start the next chud with nothing
+        config::write_atomic(&path, &state.to_string());
     }
 
     /// Reopens the layout saved at the last quit.
@@ -1425,65 +1557,41 @@ impl App {
                 self.next_gid = self.next_gid.max(id);
             }
         }
+        let home = config::home();
+        let plan = restore_plan(
+            &v,
+            &|kind, sid, cwd| usage::log_path(kind, sid, cwd).is_some_and(|p| p.exists()),
+            &|sid| usage::claude_chat_cwd(&home, sid),
+        );
+        // the sessions on screen start now; the rest follow a fifth of a second apart, so a
+        // dozen agents starting up don't all land on the machine in the same instant
+        let on_screen = layout::leaves_json(&v["layout"]);
         let mut restored_ids: Vec<Option<usize>> = vec![]; // by position in the saved list
-        for s in v["sessions"].as_array().into_iter().flatten() {
+        let mut later = 0;
+        let doubles = plan.iter().flatten().filter(|r| r.double).count();
+        for (k, reopen) in plan.into_iter().enumerate() {
             restored_ids.push(None);
-            let argv: Vec<String> =
-                s["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect();
-            let (Some(prog), Some(cwd)) = (argv.first(), s["cwd"].as_str()) else { continue };
-            let cwd = PathBuf::from(cwd);
-            let sid = s["sid"].as_str().unwrap_or_default();
-            let kind = if session::agent_of(prog) == Agent::Copilot { usage::Kind::Copilot } else { usage::Kind::Claude };
-            let saved = usage::log_path(kind, sid, &cwd).is_some_and(|p| p.exists());
-            let mut run = resume_argv(&argv, sid, saved);
-            let mut cwd = cwd;
-            let mut reopened = None;
-            // a terminal you ran claude or copilot in comes back running that chat again, in
-            // the folder it was in, and leaves you at the prompt when you quit it
-            // (state from before chud saved "resume" has only the chat id a warp-reporting claude
-            // gave; its folder is read back from the transcript)
-            let old = match s.get("resume").filter(|r| !r.is_null()) {
-                None if !sid.is_empty() => usage::claude_chat_cwd(&config::home(), sid)
-                    .map(|dir| json!({ "agent": "claude", "sid": sid, "cwd": dir })),
-                _ => None,
-            };
-            let r = old.as_ref().unwrap_or(&s["resume"]);
-            if let (Some(agent), Some(rsid), Some(rcwd)) = (r["agent"].as_str(), r["sid"].as_str(), r["cwd"].as_str()) {
-                let on_disk = usage::log_path(kind_of(agent), rsid, Path::new(rcwd)).is_some_and(|p| p.exists());
-                // a terminal gets the chat back inside its shell; a session that *was* the agent
-                // (codex, whose id chud only learns afterwards) is started as that chat directly
-                let again = match session::agent_of(prog) {
-                    Agent::Shell => resume_in_shell(&argv, agent, rsid),
-                    started if agent_name(&started) == Some(agent) => {
-                        resume_words(agent, rsid).map(|mut w| {
-                            w[0] = prog.clone(); // keep how it was started: a full path, say
-                            w
-                        })
-                    }
-                    _ => None,
-                };
-                if let Some(argv) = again.filter(|_| on_disk) {
-                    (run, cwd) = (argv, PathBuf::from(rcwd));
-                    // remembered from the start, so a save before the agent is looked at keeps it
-                    let agent = match agent {
-                        "copilot" => Agent::Copilot,
-                        "codex" => Agent::Codex,
-                        _ => Agent::Claude,
-                    };
-                    reopened = Some((agent, rsid.to_string(), cwd.clone()));
+            let Some(r) = reopen else { continue };
+            let delay = match on_screen.contains(&k) {
+                true => Duration::ZERO,
+                false => {
+                    later += 1;
+                    Duration::from_millis(200 * later)
                 }
-            }
-            let group = s["group"].as_u64().unwrap_or(0) as usize;
-            let group = if self.groups.iter().any(|g| g.id == group) { group } else { 0 };
-            if let Some(i) = self.spawn(run, cwd, group) {
-                *restored_ids.last_mut().unwrap() = Some(self.sessions[i].id);
+            };
+            if let Some(i) = self.spawn_after(r.run, r.cwd, r.group, delay) {
+                restored_ids[k] = Some(self.sessions[i].id);
                 let restored = &mut self.sessions[i];
-                restored.argv = argv;
-                restored.name = s["name"].as_str().map(String::from);
-                restored.worked = Duration::from_secs(s["worked"].as_u64().unwrap_or(0));
+                restored.argv = r.argv;
+                restored.name = r.name;
+                restored.worked = Duration::from_secs(r.worked);
                 restored.refresh_usage();
-                restored.resume = restored.resume.take().or(reopened);
+                restored.resume = restored.resume.take().or(r.chat);
             }
+        }
+        if doubles > 0 {
+            let s = if doubles == 1 { "session was" } else { "sessions were" };
+            self.flash = Some(format!(" {doubles} {s} on a chat another session already has open · opened as new instead "));
         }
         self.sel = self.visible().first().copied().unwrap_or(0);
         if let Some(layout) = layout::Node::from_json(&v["layout"], &|k| restored_ids.get(k).copied().flatten()) {
@@ -1548,7 +1656,7 @@ impl App {
         match act {
             Act::Rename(i) => {
                 self.select(i);
-                self.prompt = ask(Ask::Rename, self.sessions[i].label());
+                self.prompt = self.sessions.get(i).and_then(|s| ask(Ask::Rename, s.label()));
             }
             Act::Group(i) => {
                 self.select(i);
@@ -1577,10 +1685,21 @@ impl App {
                 }
             }
             Act::Fold(gi) => {
-                self.groups[gi].collapsed ^= true;
+                if let Some(g) = self.groups.get_mut(gi) {
+                    g.collapsed ^= true;
+                }
                 self.save();
             }
         }
+    }
+
+    /// Sessions or groups were removed or reordered: what the last frame said was under the
+    /// mouse no longer is. Events are handled in batches between frames, so a click can arrive
+    /// before the next one is drawn; until then it lands on nothing rather than on whatever
+    /// took that row's place (or on a row that is gone).
+    fn stale(&mut self) {
+        self.hits.clear();
+        (self.drag, self.hover, self.drop, self.menu) = (None, None, None, None);
     }
 
     fn hit_at(&self, col: u16, row: u16) -> Option<Hit> {
@@ -1612,7 +1731,10 @@ impl App {
                         self.follow(m); // and a selection being dragged keeps up with it
                     }
                     Some(Hit::Cards | Hit::Card(_)) => {
-                        self.dash_scroll = if up { self.dash_scroll.saturating_sub(1) } else { self.dash_scroll + 1 }
+                        // no further than the last row of cards, or they scroll away for good
+                        let area = self.hits.iter().find(|(_, h)| *h == Hit::Cards).map(|(r, _)| *r).unwrap_or_default();
+                        let last = ui::card_rows(self.sessions.len(), area).saturating_sub(1);
+                        self.dash_scroll = if up { self.dash_scroll.saturating_sub(1) } else { (self.dash_scroll + 1).min(last) }
                     }
                     _ => {
                         if let Some(d) = &mut self.diff {
@@ -1751,7 +1873,7 @@ impl App {
             Some(h @ (Hit::Session(_) | Hit::Edge)) => {
                 self.drag = Some(Drag { from: h, at: (m.column, m.row), moved: false })
             }
-            Some(Hit::SessionMenu(i)) => {
+            Some(Hit::SessionMenu(i)) if i < self.sessions.len() => {
                 let gi = self.groups.iter().position(|g| g.id == self.sessions[i].group).unwrap_or(0);
                 let mut items = vec![("Rename…", Act::Rename(i)), ("Move to group…", Act::Group(i))];
                 if self.layout.contains(self.sessions[i].id) {
@@ -1771,11 +1893,11 @@ impl App {
                 ]);
                 self.menu = at(items)
             }
-            Some(Hit::Group(gi)) => {
+            Some(Hit::Group(gi)) if gi < self.groups.len() => {
                 self.groups[gi].collapsed ^= true;
                 self.save();
             }
-            Some(Hit::GroupMenu(gi)) => {
+            Some(Hit::GroupMenu(gi)) if gi < self.groups.len() => {
                 let fold = if self.groups[gi].collapsed { "Unfold" } else { "Fold" };
                 let mut items = vec![
                     ("New terminal here", Act::NewTerminal(gi)),
@@ -1806,7 +1928,11 @@ impl App {
                 self.to_pane(m, i);
             }
             Some(Hit::ClosePane(i)) => self.close_pane(i),
-            Some(Hit::Pet(i)) => self.sessions[i].pet(),
+            Some(Hit::Pet(i)) => {
+                if let Some(s) = self.sessions.get_mut(i) {
+                    s.pet();
+                }
+            }
             Some(h @ Hit::Divider(_)) => self.drag = Some(Drag { from: h, at: (m.column, m.row), moved: false }),
             _ => {}
         }
@@ -1910,7 +2036,7 @@ impl App {
     /// The spot in the focused session's text under a window cell, clamped to its pane.
     fn spot(&self, x: u16, y: u16) -> Option<Spot> {
         let pane = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel))?.0; // the focused pane: drags start there
-        let p = self.sessions.get(self.sel)?.parser.lock().unwrap();
+        let p = self.sessions.get(self.sel)?.parser.lock();
         let (rows, back) = (p.screen().size().0, p.screen().scrollback());
         let row = y.clamp(pane.y, pane.bottom() - 1) - pane.y;
         Some((back + usize::from(rows.saturating_sub(row + 1)), x.clamp(pane.x, pane.right() - 1) - pane.x))
@@ -1933,7 +2059,7 @@ impl App {
     fn scroll_past_edge(&mut self, y: u16) {
         let Some(&(pane, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel)) else { return };
         let Some(s) = self.sessions.get(self.sel) else { return };
-        let mut p = s.parser.lock().unwrap();
+        let mut p = s.parser.lock();
         let back = p.screen().scrollback();
         match y {
             _ if y < pane.y => p.screen_mut().set_scrollback(back + 1),
@@ -1954,7 +2080,7 @@ impl App {
             self.flash = Some(" nothing selected · drag over the terminal first ".into());
             return;
         };
-        let text = picked_text(s.parser.lock().unwrap().screen_mut(), from, to);
+        let text = picked_text(s.parser.lock().screen_mut(), from, to);
         self.flash = match (text.is_empty(), copy_to_clipboard(&text)) {
             (true, _) => None,
             (_, Ok(())) => Some(format!(" copied {} characters to the clipboard ", text.chars().count())),
@@ -1968,7 +2094,7 @@ impl App {
         let Some(&(r, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Pane(i)) else { return };
         let Some(s) = self.sessions.get(i) else { return };
         let (col, row) = (m.column.saturating_sub(r.x).min(r.width - 1), m.row.saturating_sub(r.y).min(r.height - 1));
-        let mut p = s.parser.lock().unwrap();
+        let mut p = s.parser.lock();
         let screen = p.screen();
         if let Some(bytes) = mouse_bytes(m, col, row, screen.mouse_protocol_mode(), screen.mouse_protocol_encoding()) {
             drop(p);
@@ -2012,8 +2138,6 @@ fn statusline() -> Result<()> {
     Ok(())
 }
 
-/// Puts text on the system clipboard with whatever this platform provides: pbcopy on macOS,
-/// PowerShell on Windows (reading UTF-8, so non-ASCII survives), wl-copy or xclip on Linux.
 /// A place in a session's text: (lines above the bottom of the screen, column). Counting from
 /// the bottom keeps it on the same text however far back you've scrolled.
 pub type Spot = (usize, u16);
@@ -2067,6 +2191,8 @@ fn scrollbar_col(screen: &vt100::Screen) -> Option<u16> {
     (bars >= 3).then_some(last)
 }
 
+/// Puts text on the system clipboard with whatever this platform provides: pbcopy on macOS,
+/// PowerShell on Windows (reading UTF-8, so non-ASCII survives), wl-copy or xclip on Linux.
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     let windows = "[Console]::InputEncoding = [Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())";
     let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
@@ -2227,6 +2353,101 @@ mod tests {
 
     fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
+    }
+
+    fn saved(sessions: Value) -> Value {
+        json!({ "groups": [{ "id": 0, "name": "Self" }, { "id": 2, "name": "Work" }], "sessions": sessions })
+    }
+
+    fn plan(v: &Value, missing: &[&str]) -> Vec<Option<Reopen>> {
+        restore_plan(v, &|_, sid, _| !missing.contains(&sid), &|sid| (sid == "old-chat").then(|| PathBuf::from("/from/transcript")))
+    }
+
+    fn words(run: &[String]) -> String {
+        run.join(" ")
+    }
+
+    #[test]
+    fn restore_reopens_each_kind_of_session_its_own_way() {
+        let v = saved(json!([
+            // claude started by chud: resumed directly
+            { "argv": ["claude"], "cwd": "/a", "sid": "c1", "group": 2, "name": "api", "worked": 90, "resume": null },
+            // claude typed into a terminal: back inside its shell, in the folder it ran in
+            { "argv": ["zsh"], "cwd": "/b", "sid": "", "resume": { "agent": "claude", "sid": "c2", "cwd": "/b/repo" } },
+            // copilot typed into a terminal
+            { "argv": ["zsh"], "cwd": "/c", "sid": "", "resume": { "agent": "copilot", "sid": "p1", "cwd": "/c" } },
+            // codex started by chud, with a full path: the path is kept
+            { "argv": ["/opt/bin/codex"], "cwd": "/d", "sid": "", "resume": { "agent": "codex", "sid": "x1", "cwd": "/d" } },
+            // a plain terminal
+            { "argv": ["zsh"], "cwd": "/e", "sid": "", "resume": null, "group": 7 },
+            // state from before "resume" was saved: only the id, the folder comes from the transcript
+            { "argv": ["zsh"], "cwd": "/f", "sid": "old-chat" },
+            // too broken to start anything, but it keeps its place for the layout
+            { "cwd": "/g" },
+        ]));
+        let p = plan(&v, &[]);
+        let at = |k: usize| p[k].as_ref().unwrap();
+        assert_eq!((words(&at(0).run).as_str(), at(0).group, at(0).name.as_deref(), at(0).worked), ("claude --resume c1", 2, Some("api"), 90));
+        assert_eq!(at(0).argv, ["claude"], "what it was started as is kept, so the next save still knows");
+        assert_eq!((words(&at(1).run).as_str(), at(1).cwd.to_str()), ("zsh -ic claude --resume c2; exec zsh", Some("/b/repo")));
+        assert_eq!(at(1).chat, Some((Agent::Claude, "c2".into(), PathBuf::from("/b/repo"))));
+        assert_eq!(words(&at(2).run), "zsh -ic copilot --resume p1; exec zsh");
+        assert_eq!(words(&at(3).run), "/opt/bin/codex resume x1");
+        assert_eq!((words(&at(4).run).as_str(), at(4).group, &at(4).chat), ("zsh", 0, &None), "a group that is gone means ungrouped");
+        assert_eq!((words(&at(5).run).as_str(), at(5).cwd.to_str()), ("zsh -ic claude --resume old-chat; exec zsh", Some("/from/transcript")));
+        assert!(p[6].is_none() && p.len() == 7);
+    }
+
+    #[test]
+    fn restore_never_opens_a_chat_twice_or_one_that_is_gone() {
+        let typed = |sid: &str| json!({ "argv": ["zsh"], "cwd": "/home", "sid": "", "resume": { "agent": "claude", "sid": sid, "cwd": "/repo" } });
+        let v = saved(json!([typed("same"), typed("same"), typed("gone"), { "argv": ["claude"], "cwd": "/a", "sid": "same" }]));
+        let p = plan(&v, &["gone"]);
+        let at = |k: usize| p[k].as_ref().unwrap();
+        assert_eq!((words(&at(0).run).as_str(), at(0).double), ("zsh -ic claude --resume same; exec zsh", false));
+        // the second session on that chat starts fresh where it was, and says so
+        assert_eq!((words(&at(1).run).as_str(), at(1).cwd.to_str(), at(1).double, &at(1).chat), ("zsh", Some("/home"), true, &None));
+        // a chat whose transcript is gone is not resumed: the agent would refuse and exit
+        assert_eq!((words(&at(2).run).as_str(), at(2).double), ("zsh", false));
+        assert_eq!((words(&at(3).run).as_str(), at(3).double), ("claude", true), "however it was started");
+    }
+
+    #[test]
+    fn a_click_on_something_that_is_gone_does_nothing() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new((120, 40), tx);
+        app.guest = true; // never write a state file from a test
+        let area = Rect::new(0, 0, 10, 1);
+        let click = |kind| MouseEvent { kind, column: 1, row: 0, modifiers: KeyModifiers::NONE };
+        // what the last frame drew, for a session and a group that have since been removed
+        for hit in [Hit::Session(3), Hit::SessionMenu(3), Hit::Pet(3), Hit::Card(3), Hit::Pane(3), Hit::ClosePane(3), Hit::Group(5), Hit::GroupMenu(5)] {
+            app.hits = vec![(area, hit)];
+            app.mouse(click(MouseEventKind::Down(MouseButton::Left)));
+            app.mouse(click(MouseEventKind::Drag(MouseButton::Left)));
+            app.mouse(click(MouseEventKind::Up(MouseButton::Left)));
+            app.mouse(click(MouseEventKind::Down(MouseButton::Right)));
+            app.menu = None;
+        }
+        for act in [Act::Rename(3), Act::Group(3), Act::Kill(3), Act::Diff(3), Act::Fold(5), Act::GroupRename(5), Act::DeleteGroup(5), Act::ClosePane(3)] {
+            app.run_act(act);
+            app.prompt = None;
+        }
+        app.drop_session(3, Some(Hit::Session(4)));
+        app.drop_session(0, Some(Hit::Group(5)));
+    }
+
+    #[test]
+    fn only_a_running_chud_holds_the_saved_state() {
+        let lock = std::env::temp_dir().join(format!("chud-lock-{}", std::process::id()));
+        let _ = std::fs::remove_file(&lock);
+        assert!(claim_state(&lock), "nobody has it");
+        assert!(claim_state(&lock), "it is ours already");
+        // a pid left behind by a chud that died, now some other program's (or nobody's)
+        std::fs::write(&lock, "1").unwrap();
+        assert!(claim_state(&lock), "pid 1 is not a chud");
+        std::fs::write(&lock, "not a pid").unwrap();
+        assert!(claim_state(&lock));
+        let _ = std::fs::remove_file(&lock);
     }
 
     fn screen_of(rows: &[&str]) -> vt100::Parser {

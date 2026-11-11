@@ -12,6 +12,10 @@ use std::time::Duration;
 /// How often to look; GitHub is not going anywhere.
 const EVERY: Duration = Duration::from_secs(30 * 60);
 
+/// How long after starting (and after each wait) before looking: chud's own start-up, with
+/// every restored agent launching, is the worst moment to add a fetch and a build.
+const SETTLE: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Update {
     /// pulled, rebuilt and installed: this commit is waiting for a restart
@@ -41,7 +45,9 @@ pub fn pending(repo: &Path, built: &str) -> Option<String> {
 /// Pull it and rebuild. Only fast-forwards: local work in the repo is never touched.
 pub fn install(repo: &Path) -> Result<(), String> {
     git(repo, &["pull", "--ff-only", "--quiet"]).ok_or("could not fast-forward the repo")?;
-    let built = Command::new("sh").arg("bundle.sh").current_dir(repo).output().map_err(|e| e.to_string())?;
+    // at the lowest priority: it is a full optimised build, minutes of every core, and it
+    // starts by itself while you are working
+    let built = Command::new("nice").args(["-n", "19", "sh", "bundle.sh"]).current_dir(repo).output().map_err(|e| e.to_string())?;
     match built.status.success() {
         true => Ok(()),
         false => Err(String::from_utf8_lossy(&built.stderr).lines().last().unwrap_or("build failed").into()),
@@ -59,6 +65,7 @@ pub fn watch(tx: Sender<Event>) {
         return;
     }
     std::thread::spawn(move || loop {
+        std::thread::sleep(SETTLE);
         if let Some(head) = pending(&repo, built) {
             let msg = match install(&repo) {
                 Ok(()) => Update::Ready(head[..7.min(head.len())].to_string()),
@@ -68,7 +75,7 @@ pub fn watch(tx: Sender<Event>) {
                 return;
             }
         }
-        std::thread::sleep(EVERY);
+        std::thread::sleep(EVERY - SETTLE);
     });
 }
 

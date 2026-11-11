@@ -174,8 +174,8 @@ impl Usage {
         &self.path
     }
 
-    pub fn is_copilot(&self) -> bool {
-        self.kind == Kind::Copilot
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
 
     /// Reads whatever the log gained since the last call; a partial last line waits for its newline.
@@ -352,6 +352,19 @@ pub fn limits_path() -> PathBuf {
 /// Where it keeps that session's context window, one file per session id.
 pub fn context_path(sid: &str) -> PathBuf {
     crate::config::home().join(format!(".config/chud/context/{sid}.json"))
+}
+
+/// Forgets the context windows of chats nobody has touched in a month: there is a file per
+/// chat, and nothing else ever removes them.
+pub fn prune_contexts() {
+    let old = std::time::Duration::from_secs(30 * 86_400);
+    let dir = crate::config::home().join(".config/chud/context");
+    for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let age = file.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        if age.is_some_and(|a| a > old) {
+            let _ = std::fs::remove_file(file.path());
+        }
+    }
 }
 
 /// What Claude Code says is in this session's context window, which is the honest answer:

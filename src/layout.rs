@@ -169,6 +169,15 @@ impl Node {
     }
 }
 
+/// The saved positions of the sessions a saved layout shows, without rebuilding it.
+pub fn leaves_json(v: &Value) -> Vec<usize> {
+    match v.as_u64() {
+        Some(i) => vec![i as usize],
+        None if v.is_object() => [&v["a"], &v["b"]].into_iter().flat_map(leaves_json).collect(),
+        None => vec![],
+    }
+}
+
 /// Cuts `area` in two with a one-cell divider between; each side keeps at least the minimum
 /// pane size when the area has room for two.
 fn divide(area: Rect, dir: Dir, ratio: f32) -> (Rect, Rect, Rect) {
@@ -366,5 +375,13 @@ mod tests {
         assert_eq!(lost.leaves(), [20, 30], "a session that didn't come back leaves no hole");
         assert_eq!(Node::from_json(&json!({"dir": "sideways"}), &|i| Some(i)), None);
         assert_eq!(Node::from_json(&Value::Null, &|i| Some(i)), None);
+    }
+
+    #[test]
+    fn a_saved_layout_says_which_sessions_it_shows() {
+        let v = json!({ "a": 4, "b": { "a": 0, "b": 2, "dir": "across", "ratio": 0.5 }, "dir": "down", "ratio": 0.5 });
+        assert_eq!(leaves_json(&v), [4, 0, 2]);
+        assert_eq!(leaves_json(&json!(3)), [3]);
+        assert!(leaves_json(&Value::Null).is_empty());
     }
 }

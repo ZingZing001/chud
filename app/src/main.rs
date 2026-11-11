@@ -116,6 +116,7 @@ struct App {
     scroll_px: f32, // trackpad scrolling not yet worth a whole line
     font_size: f32,
     size: Size, // the window's, so a font change can re-flow the terminal to it
+    cell: Size, // one terminal cell at the current font size; measuring lays out text
 }
 
 impl App {
@@ -179,12 +180,14 @@ impl App {
         };
         let focus = TerminalView::focus(term.widget_id().clone());
         let system_theme = iced::system::theme().map(Message::SystemTheme);
-        let app = Self { term, cursor: Point::ORIGIN, scroll_px: 0.0, font_size: FONT_SIZE, size: Size::ZERO };
+        let cell = cell_size(FONT_SIZE);
+        let app = Self { term, cursor: Point::ORIGIN, scroll_px: 0.0, font_size: FONT_SIZE, size: Size::ZERO, cell };
         (app, Task::batch([focus, symbols, system_theme]))
     }
 
     /// Re-measure at the current font size and re-flow the terminal to the window.
     fn relayout(&mut self) {
+        self.cell = cell_size(self.font_size);
         self.term.handle(Command::ChangeFont(font(self.font_size)));
         self.term.handle(Command::ProxyToBackend(BackendCommand::Resize(Some(self.size), None)));
     }
@@ -213,6 +216,7 @@ impl App {
                 self.term.handle(write(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec()));
             }
             Message::FontLoaded => {
+                self.cell = cell_size(self.font_size);
                 self.term.handle(Command::ChangeFont(font(self.font_size))); // redraw with the fallback
             }
             Message::FontSize(step) => {
@@ -241,13 +245,13 @@ impl App {
             // iced_term passes on only the left button; send right-clicks to chud ourselves,
             // as a press and release in SGR mouse encoding at the cell under the pointer
             Message::RightClick => {
-                let (col, row) = self.cell_at(cell_size(self.font_size));
+                let (col, row) = self.cell_at(self.cell);
                 self.term.handle(write(format!("\x1b[<2;{col};{row}M\x1b[<2;{col};{row}m").into_bytes()));
             }
             // iced_term never reports the wheel (it scrolls, or types arrow keys in full-screen
             // apps); send chud real wheel reports instead, counted in lines like iced_term does
             Message::Wheel(delta) => {
-                let cell = cell_size(self.font_size);
+                let cell = self.cell;
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => y.round() as i32,
                     mouse::ScrollDelta::Pixels { y, .. } => {

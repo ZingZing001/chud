@@ -251,11 +251,39 @@ impl Signals {
     }
 }
 
+/// A session's terminal, shared between the thread reading the program's output and chud's
+/// drawing. vt100 has panicked on odd output before; that ends the one session (see `feed`),
+/// and the lock it held stays usable rather than taking every later reader down with it.
+#[derive(Clone)]
+pub struct Shared(Arc<Mutex<vt100::Parser<Signals>>>);
+
+impl Shared {
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, vt100::Parser<Signals>> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Runs the program's output through the terminal and returns what it should be sent back
+/// (answers to its queries). None if the terminal emulator panicked on it: the session is
+/// over, and nothing else is.
+fn feed(parser: &Shared, bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut p = parser.lock();
+        p.process(bytes);
+        std::mem::take(&mut p.callbacks_mut().reply)
+    }))
+    .ok()
+}
+
+/// The name of the threads that read sessions' output. A panic in one is caught (see `feed`),
+/// so chud's panic hook leaves the screen alone for it.
+pub const READER: &str = "session-reader";
+
 pub struct Session {
     pub id: usize,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
-    pub parser: Arc<Mutex<vt100::Parser<Signals>>>,
+    pub parser: Shared,
     pub name: Option<String>,
     pub group: usize,
     pub agent: Agent,
@@ -288,6 +316,8 @@ pub struct Session {
     heard: Instant,
     /// the agent a script or interpreter in front is running, read from its command line
     fg_script: Option<Agent>,
+    /// a process in front (pid, program) whose command line named no agent: a plain shell
+    plain: Option<(i32, String)>,
     /// the chat named on the command line of the process in front, by its pid (see `typed_chat`)
     typed: Option<(i32, Option<String>)>,
     /// when you last petted it, for the few seconds it looks pleased about it
@@ -312,6 +342,7 @@ impl Session {
         cwd: PathBuf,
         (rows, cols): (u16, u16),
         tx: Sender<Event>,
+        delay: Duration,
     ) -> Result<Self> {
         let agent = agent_of(&argv[0]);
         // a prompt on the command line (`codex "fix it"`) starts a turn by itself
@@ -324,6 +355,13 @@ impl Session {
             run.extend(["--session-id".to_string(), sid.clone()]);
         }
 
+        // a delayed start waits inside the session itself (a shell that sleeps, then becomes the
+        // program), so the session exists from the first moment: in the sidebar, in the layout
+        // and in what gets saved
+        if !delay.is_zero() && cfg!(unix) {
+            let wait = format!("sleep {:.1}; exec \"$0\" \"$@\"", delay.as_secs_f32());
+            run.splice(0..0, ["/bin/sh".to_string(), "-c".to_string(), wait]);
+        }
         let pair = native_pty_system().openpty(size(rows, cols))?;
         let mut cmd = CommandBuilder::new(&run[0]);
         cmd.args(&run[1..]);
@@ -377,23 +415,19 @@ impl Session {
                 }
             }
         });
-        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+        let parser = Shared(Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
             5000,
             Signals::default(),
-        )));
+        ))));
         let (p, w) = (parser.clone(), writer.clone());
         let unseen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waiting = unseen.clone();
-        std::thread::spawn(move || {
+        let read = move || {
             let mut buf = [0u8; 65536];
             while let Ok(n @ 1..) = reader.read(&mut buf) {
-                let reply = {
-                    let mut p = p.lock().unwrap();
-                    p.process(&buf[..n]);
-                    std::mem::take(&mut p.callbacks_mut().reply)
-                };
+                let Some(reply) = feed(&p, &buf[..n]) else { break };
                 if !reply.is_empty() {
                     let _ = w.send(reply);
                 }
@@ -404,7 +438,8 @@ impl Session {
                 }
             }
             let _ = tx.send(Event::Exited(id));
-        });
+        };
+        std::thread::Builder::new().name(READER.into()).spawn(read)?;
 
         Ok(Self {
             id,
@@ -431,6 +466,7 @@ impl Session {
             unseen,
             heard: Instant::now(),
             typed: None,
+            plain: None,
             fg_script: None,
             petted: None,
             asked,
@@ -447,8 +483,8 @@ impl Session {
     /// step ends — Claude's comes when the tool you approved finishes, which can be minutes — so
     /// the answer itself is taken as the sign it is back at work. Asking again sets it back.
     pub fn answered(&mut self) -> bool {
-        let parser = self.parser.clone();
-        let mut p = parser.lock().unwrap();
+                let parser = self.parser.clone();
+                let mut p = parser.lock();
         let signals = p.callbacks_mut();
         if self.exit.is_some() || signals.status != Status::NeedsInput {
             return false;
@@ -470,8 +506,8 @@ impl Session {
     pub fn on_output(&mut self) {
         self.heard = Instant::now();
         if self.agent == Agent::Codex && self.exit.is_none() {
-            let parser = self.parser.clone();
-            let mut p = parser.lock().unwrap();
+                        let parser = self.parser.clone();
+                        let mut p = parser.lock();
             let signals = p.callbacks_mut();
             let next = codex_status(&signals.title, signals.status);
             // before you have asked it anything its spinner is codex starting up, and treating
@@ -493,8 +529,8 @@ impl Session {
         if !self.infers_status() {
             return false;
         }
-        let parser = self.parser.clone();
-        let mut p = parser.lock().unwrap();
+                let parser = self.parser.clone();
+                let mut p = parser.lock();
         let signals = p.callbacks_mut();
         if signals.progress_seen {
             return false;
@@ -518,7 +554,7 @@ impl Session {
 
     pub fn paste(&self, text: &str) {
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
-        if self.parser.lock().unwrap().screen().bracketed_paste() {
+        if self.parser.lock().screen().bracketed_paste() {
             self.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
         } else {
             self.write(text.as_bytes());
@@ -539,7 +575,7 @@ impl Session {
     }
 
     pub fn resize(&self, (rows, cols): (u16, u16)) {
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock();
         if p.screen().size() == (rows, cols) {
             return; // unchanged: don't make the program redraw for nothing
         }
@@ -550,7 +586,7 @@ impl Session {
     pub fn status(&self) -> Status {
         match self.exit {
             Some(_) => Status::Exited,
-            None => self.parser.lock().unwrap().callbacks().status,
+            None => self.parser.lock().callbacks().status,
         }
     }
 
@@ -559,7 +595,7 @@ impl Session {
         if let Some(name) = &self.name {
             return name.clone();
         }
-        let chat = self.parser.lock().unwrap().callbacks().chat.clone();
+        let chat = self.parser.lock().callbacks().chat.clone();
         let chat = if self.agent == Agent::Codex { codex_chat(&chat) } else { chat };
         if chat.is_empty() { self.folder() } else { chat }
     }
@@ -575,13 +611,13 @@ impl Session {
 
     /// Last prompt / response / permission request, on one line.
     pub fn detail(&self) -> String {
-        let p = self.parser.lock().unwrap();
+        let p = self.parser.lock();
         p.callbacks().summary.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// The agent's own session id: as reported by the plugin, else the one we assigned.
     pub fn agent_sid(&self) -> String {
-        let p = self.parser.lock().unwrap();
+        let p = self.parser.lock();
         let reported = &p.callbacks().sid;
         if reported.is_empty() { self.sid.clone() } else { reported.clone() }
     }
@@ -607,7 +643,14 @@ impl Session {
                 Agent::Other(name) => agents::is_interpreter(name),
                 _ => false,
             };
-            self.fg_script = if scripted { proc_args(pid).and_then(|a| agent_in_cmdline(&a, agents::all())) } else { None };
+            // ...and not again for the shell you keep coming back to between commands: asking
+            // starts a process, on the thread that draws
+            let path = proc_path(pid).unwrap_or_default();
+            let plain = self.plain.as_ref().is_some_and(|(p, exe)| *p == pid && *exe == path);
+            self.fg_script = if scripted && !plain { proc_args(pid).and_then(|a| agent_in_cmdline(&a, agents::all())) } else { None };
+            if scripted && self.fg_script.is_none() {
+                self.plain = Some((pid, path));
+            }
         }
         if let Some(script) = &self.fg_script {
             agent = script.clone();
@@ -626,7 +669,7 @@ impl Session {
         }
         self.agent = agent;
         self.asked = false; // the Enter that started it was not a question for it
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock();
         let s = p.callbacks_mut();
         s.chat.clear(); // a different program: the old chat's name, summary and id no longer apply
         s.summary.clear();
@@ -659,7 +702,7 @@ impl Session {
         let (sid, found_cwd) = match (by_pid, &self.found) {
             // Claude writes that file as it starts; after a /resume only the id it reports is current
             (Some((sid, cwd)), _) => {
-                let reported = self.parser.lock().unwrap().callbacks().sid.clone();
+                let reported = self.parser.lock().callbacks().sid.clone();
                 (if reported.is_empty() { sid } else { reported }, cwd)
             }
             (None, Some(sid)) if copilot => (sid.clone(), None),
@@ -668,7 +711,7 @@ impl Session {
                 reported => (reported, None),
             },
         };
-        let agent_cwd = self.parser.lock().unwrap().callbacks().agent_cwd.clone();
+        let agent_cwd = self.parser.lock().callbacks().agent_cwd.clone();
         // Copilot says nothing of its folder, and may have been started after a cd: ask the system
         let cwd = found_cwd
             .or_else(|| self.fg_pid.filter(|_| copilot).and_then(proc_cwd))
@@ -742,14 +785,14 @@ impl Session {
     pub fn check_screen(&mut self) -> bool {
         let watched = matches!(self.agent, Agent::Claude | Agent::Copilot);
         if self.exit.is_some() || !watched {
-            let asking = std::mem::take(&mut self.parser.lock().unwrap().callbacks_mut().asking);
+            let asking = std::mem::take(&mut self.parser.lock().callbacks_mut().asking);
             return std::mem::take(&mut self.compacting) || asking;
         }
         if self.compact_checked.elapsed() < Duration::from_millis(300) {
             return false;
         }
         self.compact_checked = Instant::now();
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock();
         let screen = p.screen().contents();
         if self.agent == Agent::Claude {
             let now = screen.contains("Compacting conversation") || screen.contains("Compacting at auto window");
@@ -801,6 +844,9 @@ impl Session {
     }
 
     pub fn reap(&mut self) {
+        // usually it has exited already; if its terminal gave up on it instead, it goes now,
+        // or waiting for it would hold up everything
+        let _ = self.child.kill();
         self.exit = Some(self.child.wait().map(|s| s.exit_code()).unwrap_or(1));
     }
 }
@@ -889,7 +935,7 @@ fn proc_cwd(pid: i32) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn proc_path(pid: i32) -> Option<String> {
+pub fn proc_path(pid: i32) -> Option<String> {
     let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: the buffer is valid for its full length, which is what we pass.
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
@@ -897,7 +943,7 @@ fn proc_path(pid: i32) -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn proc_path(pid: i32) -> Option<String> {
+pub fn proc_path(pid: i32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -917,6 +963,22 @@ mod tests {
         let mut p = vt100::Parser::new_with_callbacks(40, 120, 0, Signals::default());
         p.process(bytes);
         std::mem::take(p.callbacks_mut())
+    }
+
+    #[test]
+    fn a_terminal_that_panics_ends_its_session_only() {
+        let shared = Shared(Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(4, 20, 0, Signals::default()))));
+        assert_eq!(super::feed(&shared, b"hello\x1b[c"), Some(b"\x1b[?62;22c".to_vec()), "output goes in, replies come out");
+        // a panic while the lock is held, as vt100 has done on odd output
+        let held = shared.clone();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = held.lock();
+            panic!("the terminal emulator gave up");
+        }));
+        assert!(crashed.is_err());
+        // everything that reads the screen afterwards still can
+        assert!(shared.lock().screen().contents().contains("hello"));
+        assert!(super::feed(&shared, b" again").is_some());
     }
 
     #[test]

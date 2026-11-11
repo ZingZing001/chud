@@ -364,7 +364,7 @@ fn panes(f: &mut Frame, app: &App, main: Rect, hits: &mut Hits) {
             f.render_widget(Line::from(" ✕ ").fg(pal().dim).bg(pal().bar_bg), close);
             hits.push((close, Hit::ClosePane(i)));
         }
-        let p = s.parser.lock().unwrap();
+        let p = s.parser.lock();
         let screen = p.screen();
         // the cursor shows only where your typing goes
         let cursor = Cursor::default().visibility(i == app.sel && !screen.hide_cursor() && screen.scrollback() == 0);
@@ -666,6 +666,12 @@ fn session_item(s: &Session, num: usize, headers: bool, width: u16) -> ListItem<
     ListItem::new(vec![Line::from(first), Line::from(second)])
 }
 
+/// How many rows of cards `sessions` cards make in `area`.
+pub fn card_rows(sessions: usize, area: Rect) -> u16 {
+    let per_row = (area.width / CARD_W).max(1) as usize;
+    sessions.div_ceil(per_row) as u16
+}
+
 /// The summary page: totals, a tokens-over-time chart, who ate the most, and a card per chud.
 fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let order: Vec<usize> =
@@ -708,9 +714,9 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     // output tokens in 2-minute buckets over the last two hours, per agent kind
     let now = now_secs() / 60;
     let start = now.saturating_sub(119);
-    let mut buckets = [[0u64; 60]; 2];
+    let mut buckets = [[0u64; 60]; 3];
     for s in &app.sessions {
-        let kind = s.usage.is_copilot() as usize;
+        let kind = s.usage.kind() as usize; // claude, copilot, codex
         for (&minute, &t) in s.usage.timeline.range(start..=now) {
             buckets[kind][((minute - start) / 2) as usize] += t;
         }
@@ -721,7 +727,10 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     let line = |name, data, color| {
         Dataset::default().name(name).marker(Marker::Braille).graph_type(GraphType::Line).style(color).data(data)
     };
-    let chart = Chart::new(vec![line("claude", &points[0], pal().claude), line("copilot", &points[1], pal().copilot)])
+    // an agent that produced nothing gets no line: a flat one along the bottom reads as data
+    let series = [("claude", pal().claude), ("copilot", pal().copilot), ("codex", pal().codex)];
+    let lines = series.into_iter().enumerate().filter(|(k, _)| buckets[*k].iter().any(|&t| t > 0));
+    let chart = Chart::new(lines.map(|(k, (name, color))| line(name, &points[k], color)).collect())
         .block(Block::bordered().title(" tokens produced · last 2 hours ").border_style(pal().dim))
         .x_axis(Axis::default().bounds([0.0, 59.0]).labels(["-2h", "-1h", "now"]).style(pal().dim))
         .y_axis(Axis::default().bounds([0.0, peak as f64]).labels(["0".into(), tokens(peak / 2), tokens(peak)]).style(pal().dim));
@@ -804,15 +813,15 @@ fn activity(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     let peak = grid.iter().flatten().copied().max().unwrap_or(0).max(1);
+    // four steps, like a contribution graph: the lightest still reads against the empties
+    let tone = |step: u8| {
+        let (lo, hi) = (pal().heat_low, pal().heat_high);
+        let f = |from: u8, to: u8| (from as i16 + (to as i16 - from as i16) * step as i16 / 4) as u8;
+        Color::Rgb(f(lo.0, hi.0), f(lo.1, hi.1), f(lo.2, hi.2))
+    };
     let shade = |t: u64| match t {
         0 => pal().heat_empty,
-        // four steps, like a contribution graph: the lightest still reads against the empties
-        t => {
-            let step = (t * 4).div_ceil(peak).clamp(1, 4) as u8;
-            let (lo, hi) = (pal().heat_low, pal().heat_high);
-            let f = |from: u8, to: u8| (from as i16 + (to as i16 - from as i16) * step as i16 / 4) as u8;
-            Color::Rgb(f(lo.0, hi.0), f(lo.1, hi.1), f(lo.2, hi.2))
-        }
+        t => tone((t * 4).div_ceil(peak).clamp(1, 4) as u8),
     };
     let mut lines: Vec<Line> = grid
         .iter()
@@ -829,7 +838,7 @@ fn activity(f: &mut Frame, app: &App, area: Rect) {
     let mut axis = vec![Span::raw("    ")];
     axis.extend((0..24).step_by(6).map(|h| format!("{h:02}          ").fg(pal().dim)));
     axis.push(" less ".fg(pal().dim));
-    axis.extend([1, peak / 3, peak * 2 / 3, peak].map(|t| Span::styled("█", Style::new().fg(shade(t)))));
+    axis.extend((1..=4).map(|step| Span::styled("█", Style::new().fg(tone(step)))));
     axis.push(" more".fg(pal().dim));
     lines.push(Line::from(axis));
     f.render_widget(Paragraph::new(lines), inner);
