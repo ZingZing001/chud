@@ -6,6 +6,7 @@ mod layout;
 mod update;
 mod session;
 mod setup;
+mod stitch;
 mod theme;
 mod ui;
 mod usage;
@@ -19,6 +20,7 @@ use crossterm::execute;
 use ratatui::layout::Rect;
 use serde_json::{json, Value};
 use session::{Agent, Event, Session, Status};
+use stitch::{gutter, scrollbar_col};
 use std::cmp::Reverse;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
@@ -65,6 +67,11 @@ impl Write for Frames {
     }
 }
 const TICK: Duration = Duration::from_secs(1);
+/// How often a selection held past the edge of its pane scrolls another notch.
+const AUTOSCROLL: Duration = Duration::from_millis(80);
+/// How long a full-screen program's screen must go unchanged before a capture reads it: it
+/// redraws a scroll in pieces, and half a frame would read as different text.
+const SETTLED: Duration = Duration::from_millis(40);
 const SIDE: u16 = 38;
 const DEFAULT_CMD: &str = if cfg!(windows) { "powershell" } else { "zsh" }; // what a new terminal runs
 
@@ -289,6 +296,16 @@ struct Menu {
     items: Vec<(&'static str, Act)>,
 }
 
+/// What a drag over a pane has selected.
+enum Picked {
+    /// a program in the normal screen: held to chud's own scrollback, exactly, so it stays on
+    /// the same text however far you scroll
+    Scrollback(Spot, Spot),
+    /// a full-screen program keeps its own scrollback, out of chud's sight: what the drag passes
+    /// over is collected as the program scrolls, and the selection's ends are kept in it
+    Captured(stitch::Capture),
+}
+
 /// A mouse press being held: a session being dragged, the sidebar edge, or the agent's pane.
 /// It only counts as moved once the pointer reaches another cell: chud.app reports a drag for
 /// every pixel of jitter while the button is down.
@@ -504,9 +521,12 @@ struct App {
     hover: Option<Hit>,
     /// mouse reporting off so the terminal can select text (C-a v, or holding ⌥)
     select: bool,
-    /// dragging over the terminal selects its text: (anchor, cursor), held to the text rather
-    /// than the screen so it stays put while you scroll
-    picked: Option<(Spot, Spot)>,
+    /// dragging over the terminal selects its text
+    picked: Option<Picked>,
+    /// where the mouse was last seen during a drag: held past a pane's edge, it keeps scrolling
+    pointer: (u16, u16),
+    /// when a held selection last scrolled a notch
+    scrolled: Instant,
     /// sidebar width parked here while the terminal is zoomed (C-a f)
     zoom: Option<u16>,
     /// the window changed size: repaint every cell, not just the ones that differ
@@ -635,7 +655,16 @@ fn run(term: &mut Term) -> Result<()> {
                     || s.petted()
                     || s.probe_due()
             });
-        let first = if ticking { rx.recv_timeout(TICK).ok() } else { Some(rx.recv()?) };
+        let scrolling = app.past_edge() != 0;
+        let wait = match (scrolling, ticking) {
+            (true, _) => Some(AUTOSCROLL.saturating_sub(app.scrolled.elapsed())),
+            (false, true) => Some(TICK),
+            (false, false) => None,
+        };
+        let first = match wait {
+            Some(wait) => rx.recv_timeout(wait).ok(),
+            None => Some(rx.recv()?),
+        };
         let mut typed = matches!(first, Some(Event::Input(_)));
         let mut dirty = first.is_some_and(|e| app.handle(e));
         while let Ok(e) = rx.try_recv() {
@@ -651,6 +680,10 @@ fn run(term: &mut Term) -> Result<()> {
         }
         if ticking && last.elapsed() >= TICK {
             app.tick();
+            dirty = true;
+        }
+        if app.past_edge() != 0 && app.scrolled.elapsed() >= AUTOSCROLL {
+            app.autoscroll();
             dirty = true;
         }
         if dirty {
@@ -701,6 +734,8 @@ impl App {
             hover: None,
             select: false,
             picked: None,
+            pointer: (0, 0),
+            scrolled: Instant::now(),
             zoom: None,
             resized: false,
             flash: None,
@@ -1728,6 +1763,9 @@ impl App {
                 match hit {
                     Some(Hit::Pane(i)) => {
                         self.to_pane(m, i); // scrolls that pane, focused or not
+                        if self.drag.is_some() {
+                            self.pointer = (m.column, m.row);
+                        }
                         self.follow(m); // and a selection being dragged keeps up with it
                     }
                     Some(Hit::Cards | Hit::Card(_)) => {
@@ -1921,11 +1959,11 @@ impl App {
                 if i != self.sel {
                     self.select(i); // clicking a pane focuses it
                 }
-                // where a selection would start; a press that never moves is just a click,
-                // and the agent gets it either way
-                self.picked = self.spot(m.column, m.row).map(|at| (at, at));
+                // where a selection would start. The program hears about the press only once it
+                // turns out to be a click (see release): sent now, a drag would leave it holding
+                // the button, or selecting text of its own under chud's selection
+                self.picked = self.spot(m.column, m.row).map(|at| Picked::Scrollback(at, at));
                 self.drag = Some(Drag { from: Hit::Pane(i), at: (m.column, m.row), moved: false });
-                self.to_pane(m, i);
             }
             Some(Hit::ClosePane(i)) => self.close_pane(i),
             Some(Hit::Pet(i)) => {
@@ -1940,18 +1978,24 @@ impl App {
 
     fn drag_to(&mut self, hit: Option<Hit>, m: MouseEvent) {
         let Some(d) = &mut self.drag else { return };
-        d.moved |= (m.column, m.row) != d.at;
+        let started = !d.moved && (m.column, m.row) != d.at;
+        d.moved |= started;
+        let at = d.at;
         match d.from {
             _ if !d.moved => {}
             Hit::Edge => self.side = (m.column + 1).clamp(24, (self.size.0 / 2).max(24)),
-            // dragging over the terminal selects its text rather than reaching the agent
-            Hit::Pane(i) => match self.picked {
-                Some(_) => {
-                    self.scroll_past_edge(m.row);
-                    self.follow(m);
+            // dragging over the terminal selects its text rather than reaching the agent; held
+            // past the pane's edge it scrolls (see autoscroll)
+            Hit::Pane(i) => {
+                self.pointer = (m.column, m.row);
+                if started {
+                    self.start_capture(i, at);
                 }
-                None => self.to_pane(m, i),
-            },
+                match self.picked {
+                    Some(_) => self.follow(m),
+                    None => self.to_pane(m, i),
+                }
+            }
             // the panes follow the divider as you drag; terminals are resized once you let go
             Hit::Divider(k) => {
                 if let Some(div) = self.layout.dividers(self.main_area()).get(k) {
@@ -2006,6 +2050,9 @@ impl App {
     }
 
     fn release(&mut self, hit: Option<Hit>, m: MouseEvent) {
+        if matches!(self.drag, Some(Drag { from: Hit::Pane(_), moved: true, .. })) {
+            self.follow(m); // where it was let go is where it ends
+        }
         let Some(d) = self.drag.take() else { return };
         self.hover = None;
         let dropped = self.drop.take();
@@ -2021,8 +2068,10 @@ impl App {
                 self.save();
             }
             Hit::Pane(_) if d.moved => self.copy_picked(),
+            // a click: the press held back in `press`, then this release
             Hit::Pane(i) => {
                 self.picked = None;
+                self.to_pane(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: d.at.0, row: d.at.1, ..m }, i);
                 self.to_pane(m, i);
             }
             Hit::Divider(_) => {
@@ -2042,48 +2091,146 @@ impl App {
         Some((back + usize::from(rows.saturating_sub(row + 1)), x.clamp(pane.x, pane.right() - 1) - pane.x))
     }
 
+    /// The cell of the focused pane under a window position, clamped to the pane: (row, column).
+    fn pane_cell(&self, x: u16, y: u16) -> Option<(u16, u16)> {
+        let pane = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel))?.0;
+        Some((y.clamp(pane.y, pane.bottom() - 1) - pane.y, x.clamp(pane.x, pane.right() - 1) - pane.x))
+    }
+
+    /// A press on a full-screen program's pane has become a drag: start collecting what it
+    /// passes over, from the screen as it is now.
+    fn start_capture(&mut self, i: usize, (x, y): (u16, u16)) {
+        let Some((row, col)) = self.pane_cell(x, y) else { return };
+        let Some(s) = self.sessions.get(i).filter(|_| self.picked.is_some()) else { return };
+        let mut p = s.parser.lock();
+        if !p.screen().alternate_screen() {
+            return; // chud keeps this one's scrollback itself: the exact way works
+        }
+        p.callbacks_mut().scrolls.take(); // scrolls from before this selection are not its own
+        self.picked = Some(Picked::Captured(stitch::Capture::new(stitch::lines_of(p.screen()), (row, col))));
+    }
+
+    /// Brings a capture up to date with what the program shows now, once its screen has settled.
+    fn catch_up(&mut self) {
+        let (Some(Picked::Captured(cap)), Some(s)) = (&mut self.picked, self.sessions.get(self.sel)) else { return };
+        if s.quiet_for() >= SETTLED {
+            let mut p = s.parser.lock();
+            let told = p.callbacks_mut().scrolls.take();
+            cap.follow(stitch::lines_of(p.screen()), told);
+        }
+    }
+
     /// Moves the dragged end of a selection to the mouse.
     fn follow(&mut self, m: MouseEvent) {
         if !matches!(self.drag, Some(Drag { from: Hit::Pane(_), .. })) {
             return;
         }
-        let at = self.spot(m.column, m.row);
-        if let (Some((_, to)), Some(at)) = (self.picked.as_mut(), at) {
-            *to = at;
+        self.catch_up();
+        let (spot, cell) = (self.spot(m.column, m.row), self.pane_cell(m.column, m.row));
+        let past = self.past_edge_at(m.row);
+        match &mut self.picked {
+            Some(Picked::Scrollback(_, to)) => *to = spot.unwrap_or(*to),
+            Some(Picked::Captured(cap)) => {
+                if let Some((row, col)) = cell {
+                    // held past the edge, the selection ends at the last line of the text that
+                    // scrolls, not at whatever the program keeps fixed there (its input box)
+                    let row = match past {
+                        p if p > 0 => cap.moving_edge(true).unwrap_or(row),
+                        p if p < 0 => cap.moving_edge(false).unwrap_or(row),
+                        _ => row,
+                    };
+                    let col = if past > 0 { u16::MAX - 1 } else if past < 0 { 0 } else { col };
+                    cap.to = cap.line_at(row).map_or(cap.to, |line| (line, col));
+                }
+            }
+            None => {}
         }
     }
 
-    /// Dragging a selection above or below the pane scrolls the text under it, a line per
-    /// mouse move, so a selection can be longer than the pane.
-    // ponytail: scrolls only while the mouse moves; a timer would keep it going when held still
-    fn scroll_past_edge(&mut self, y: u16) {
+    /// How many rows above (negative) or below (positive) the focused pane a selection is being
+    /// held; 0 when it is inside, or nothing is being selected.
+    fn past_edge(&self) -> i32 {
+        if self.picked.is_none() || !matches!(self.drag, Some(Drag { from: Hit::Pane(_), moved: true, .. })) {
+            return 0;
+        }
+        self.past_edge_at(self.pointer.1)
+    }
+
+    /// How many rows above (negative) or below (positive) the focused pane window row `y` is.
+    fn past_edge_at(&self, y: u16) -> i32 {
+        let Some(&(pane, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel)) else { return 0 };
+        let y = i32::from(y);
+        let (top, bottom) = (i32::from(pane.y), i32::from(pane.bottom()));
+        if y < top { y - top } else if y >= bottom { y - bottom + 1 } else { 0 }
+    }
+
+    /// While a selection is held past its pane's edge, every `AUTOSCROLL`: the text moves on a
+    /// notch, two when the mouse is further out, and the selection follows it. A program that
+    /// keeps its own scrollback is sent the wheel, as if you had scrolled it yourself.
+    fn autoscroll(&mut self) {
+        self.scrolled = Instant::now();
+        let past = self.past_edge();
         let Some(&(pane, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Pane(self.sel)) else { return };
-        let Some(s) = self.sessions.get(self.sel) else { return };
-        let mut p = s.parser.lock();
-        let back = p.screen().scrollback();
-        match y {
-            _ if y < pane.y => p.screen_mut().set_scrollback(back + 1),
-            _ if y >= pane.bottom() => p.screen_mut().set_scrollback(back.saturating_sub(1)),
-            _ => {}
+        let at = |row| MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: self.pointer.0, row, modifiers: KeyModifiers::NONE };
+        let held = at(self.pointer.1);
+        // the selection reaches what is on screen now, then the text moves on
+        self.follow(held);
+        let kind = if past > 0 { MouseEventKind::ScrollDown } else { MouseEventKind::ScrollUp };
+        let middle = MouseEvent { kind, column: pane.x + pane.width / 2, row: pane.y + pane.height / 2, modifiers: KeyModifiers::NONE };
+        for _ in 0..if past.abs() >= 2 { 2 } else { 1 } {
+            self.to_pane(middle, self.sel);
         }
+        self.follow(held); // chud's own scrollback moved already; a program's catches up next time
     }
 
-    /// What the drag covered, the earlier spot first; None for a press that never moved.
+    /// What the drag covered in chud's scrollback, the earlier spot first; None for a press that
+    /// never moved, or a selection of a full-screen program.
     pub fn picked_cells(&self) -> Option<(Spot, Spot)> {
-        let (a, b) = self.picked?;
+        let Some(Picked::Scrollback(a, b)) = self.picked else { return None };
         (a != b).then(|| if (Reverse(a.0), a.1) < (Reverse(b.0), b.1) { (a, b) } else { (b, a) })
+    }
+
+    /// The columns of the focused pane's screen row `row` that the selection covers, for drawing
+    /// it. `back` is how far chud's scrollback is scrolled.
+    pub fn lit(&self, row: u16, rows: u16, cols: u16, back: usize) -> Option<(u16, u16)> {
+        // (first line, column), (last line, column), and the line this row shows, in an order
+        // where the first line comes first
+        let (first, last, line) = match self.picked.as_ref()? {
+            Picked::Scrollback(..) => {
+                let ((l1, c1), (l2, c2)) = self.picked_cells()?;
+                let line = back + usize::from(rows.saturating_sub(row + 1));
+                // scrollback lines count up from the bottom: flip them to reading order
+                ((usize::MAX - l1, c1), (usize::MAX - l2, c2), usize::MAX - line)
+            }
+            Picked::Captured(cap) => {
+                let (a, b) = cap.ends()?;
+                (a, b, cap.line_on(row)?)
+            }
+        };
+        if line < first.0 || line > last.0 {
+            return None;
+        }
+        Some((if line == first.0 { first.1 } else { 0 }, if line == last.0 { last.1 } else { cols.saturating_sub(1) }))
     }
 
     /// Copies the dragged-over text. The selection stays lit so you can see what you got.
     fn copy_picked(&mut self) {
-        let (Some((from, to)), Some(s)) = (self.picked_cells(), self.sessions.get(self.sel)) else {
-            self.flash = Some(" nothing selected · drag over the terminal first ".into());
-            return;
+        self.catch_up();
+        let (text, lost) = match (&self.picked, self.sessions.get(self.sel)) {
+            (Some(Picked::Captured(cap)), _) if cap.ends().is_some() => (cap.selected(), cap.lost()),
+            (Some(Picked::Scrollback(..)), Some(s)) if self.picked_cells().is_some() => {
+                let (from, to) = self.picked_cells().unwrap_or_default();
+                (picked_text(s.parser.lock().screen_mut(), from, to), false)
+            }
+            _ => {
+                self.flash = Some(" nothing selected · drag over the terminal first ".into());
+                return;
+            }
         };
-        let text = picked_text(s.parser.lock().screen_mut(), from, to);
+        let lost = if lost { " · lost track of the scroll, so it stops where that happened" } else { "" };
         self.flash = match (text.is_empty(), copy_to_clipboard(&text)) {
             (true, _) => None,
-            (_, Ok(())) => Some(format!(" copied {} characters to the clipboard ", text.chars().count())),
+            (_, Ok(())) => Some(format!(" copied {} characters to the clipboard{lost} ", text.chars().count())),
             (_, Err(e)) => Some(format!(" could not copy: {e} ")),
         };
     }
@@ -2164,31 +2311,6 @@ fn picked_text(screen: &mut vt100::Screen, (l1, c1): Spot, (l2, c2): Spot) -> St
     }
     screen.set_scrollback(back);
     text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
-}
-
-/// A row Copilot drew in its thinking block: " │ " ahead of the text. Exactly that, so a tree
-/// (`│   ├── src`) or a table, which start at the edge or further in, are copied whole.
-fn gutter(screen: &vt100::Screen, r: u16) -> bool {
-    let at = |c| screen.cell(r, c).map(|c| c.contents()).unwrap_or_default();
-    at(0).trim().is_empty() && at(1) == "│" && at(2).trim().is_empty()
-}
-
-/// The last column, when it holds a scrollbar rather than text: nothing in it but blanks and
-/// box-drawing, with a few vertical bars or blocks. ASCII `|` never counts, so a shell pipe or
-/// a table that reaches the edge stays.
-fn scrollbar_col(screen: &vt100::Screen) -> Option<u16> {
-    let (rows, cols) = screen.size();
-    let last = cols.checked_sub(1)?;
-    let mut bars = 0;
-    for r in 0..rows {
-        let cell = screen.cell(r, last).map(|c| c.contents()).unwrap_or_default();
-        match cell.chars().next() {
-            None | Some(' ') => {}
-            Some(c @ '\u{2500}'..='\u{259f}') => bars += "│┃║╎╏┆┇┊┋▌▐█░▒▓▕▏".contains(c) as u16,
-            Some(_) => return None,
-        }
-    }
-    (bars >= 3).then_some(last)
 }
 
 /// Puts text on the system clipboard with whatever this platform provides: pbcopy on macOS,

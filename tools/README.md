@@ -7,6 +7,10 @@ Build first (`cargo build --release`); every script takes another binary to comp
 - `python3 tools/restore.py` — sessions come back after chud is killed: a chat opened by typing
   `claude --resume`, twice over; a second chud leaving the first one's alone; a chat saved twice
   resumed once; an agent you quit staying quit. Exits non-zero on a failure.
+- `python3 tools/selection.py` — a selection held past a pane's edge keeps scrolling and copies
+  everything it passed over, in order: in a full-screen program that scrolls itself (the
+  stand-in `fullscreen.py`, built like Claude Code's and Copilot's screens), both ways, and in a
+  plain shell. Puts your clipboard back afterwards.
 - `python3 tools/load.py [chud] [seconds]` — chud's CPU with twelve sessions printing hard.
   Run it on the build before and after a change to the drawing or the event loop.
 - `python3 tools/shot.py out.png [--light] [--size 110x42] [actions]` — a PNG of what chud draws,

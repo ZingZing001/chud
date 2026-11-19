@@ -776,15 +776,9 @@ fn dashboard(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
 /// cell to the last in reading order, not as a rectangle. The selection belongs to the text, so
 /// it scrolls with it.
 fn picked(f: &mut Frame, app: &App, term: Rect, back: usize) {
-    let Some(((l1, c1), (l2, c2))) = app.picked_cells() else { return };
     let buf = f.buffer_mut();
     for row in 0..term.height {
-        let line = back + usize::from(term.height - 1 - row);
-        if line > l1 || line < l2 {
-            continue;
-        }
-        let from = if line == l1 { c1 } else { 0 };
-        let to = if line == l2 { c2 } else { term.width.saturating_sub(1) };
+        let Some((from, to)) = app.lit(row, term.height, term.width, back) else { continue };
         for col in from..=to.min(term.width.saturating_sub(1)) {
             buf[(term.x + col, term.y + row)].set_style(Style::new().add_modifier(Modifier::REVERSED));
         }
@@ -985,7 +979,7 @@ fn menu(f: &mut Frame, m: &Menu, hits: &mut Hits) {
 const HELP: &[(&str, &str)] = &[
     ("click", "select a session · … opens its menu · a group header folds it"),
     ("drag", "a session onto another session or a group to move it"),
-    ("drag in the terminal", "select text, scrolling past the edge for more; letting go copies it"),
+    ("drag in the terminal", "select text; hold it past the edge and it keeps scrolling; letting go copies it"),
     ("drag edge", "the sidebar's right edge to resize it"),
     ("toolbar", "+ New (terminal or group) · Dashboard · Diff · Help"),
     ("C-a n", "new terminal (zsh) in this group"),

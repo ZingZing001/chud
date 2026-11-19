@@ -141,6 +141,8 @@ pub struct Signals {
     pub summary: String,
     pub sid: String,
     pub agent_cwd: String,
+    /// scrolls the program did itself, for a selection that runs past the edge (see `stitch`)
+    pub scrolls: crate::stitch::ScrollWatch,
     reply: Vec<u8>,
 }
 
@@ -269,6 +271,8 @@ impl Shared {
 fn feed(parser: &Shared, bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut p = parser.lock();
+        let rows = p.screen().size().0;
+        p.callbacks_mut().scrolls.feed(bytes, rows);
         p.process(bytes);
         std::mem::take(&mut p.callbacks_mut().reply)
     }))
@@ -735,6 +739,14 @@ impl Session {
     /// chud is about to look at this session's output; anything printed after this is news.
     pub fn output_seen(&self) {
         self.unseen.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How long the program has printed nothing, counting output chud has yet to look at.
+    pub fn quiet_for(&self) -> Duration {
+        match self.unseen.load(std::sync::atomic::Ordering::Acquire) {
+            true => Duration::ZERO,
+            false => self.heard.elapsed(),
+        }
     }
 
     pub fn probe_due(&self) -> bool {
