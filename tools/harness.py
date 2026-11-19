@@ -5,8 +5,8 @@ import fcntl, json, os, pty, select, signal, struct, subprocess, tempfile, termi
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # A program called `claude` or `copilot` as far as chud can tell (it goes by the executable's
-# name). Like the real ones it notes which chat it has open under ~/.claude/sessions/<pid>.json,
-# prints a line, and waits.
+# name). Like the real ones it notes which chat it has open (~/.claude/sessions/<pid>.json, or a
+# lock in the Copilot chat's folder), prints a line, and waits.
 STUB = r'''
 #include <stdio.h>
 #include <string.h>
@@ -21,6 +21,9 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof path, "%s/.claude/sessions/%d.json", home, getpid());
     FILE *f = fopen(path, "w");
     if (f) { fprintf(f, "{\"sessionId\":\"%s\",\"cwd\":\"%s\"}", id, cwd); fclose(f); }
+    /* and as Copilot marks the chat it has open */
+    snprintf(path, sizeof path, "%s/.copilot/session-state/%s/inuse.%d.lock", home, id, getpid());
+    if (*id && strstr(argv[0], "copilot") && (f = fopen(path, "w"))) fclose(f);
     const char *replay = getenv("CHUD_STUB_REPLAY");
     if (replay && (f = fopen(replay, "r"))) { int c; while ((c = fgetc(f)) != EOF) putchar(c); fclose(f); }
     else printf("stand-in agent, chat %s\r\n", id);

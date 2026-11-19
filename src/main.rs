@@ -80,6 +80,8 @@ enum Ask {
     Kill,
     Discard,
     Quit,
+    /// restart into the newly installed chud while agents are busy
+    Restart,
     Rename,
     Group,
     GroupRename(usize), // index into App.groups
@@ -125,7 +127,7 @@ impl Prompt {
 
     /// Yes/no prompts answer a question; the rest take typing.
     fn yes_no(&self) -> bool {
-        matches!(self.ask, Ask::Kill | Ask::Discard | Ask::Quit)
+        matches!(self.ask, Ask::Kill | Ask::Discard | Ask::Quit | Ask::Restart)
     }
 }
 
@@ -167,6 +169,15 @@ enum Tool {
     Dash,
     Diff,
     Help,
+    About,
+}
+
+/// The buttons on the About screen.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AboutAct {
+    Check,
+    Restart,
+    Close,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -203,6 +214,7 @@ enum Hit {
     /// the chud on a pane's header, which you can pet
     Pet(usize),
     Backdrop,
+    About(AboutAct),
     SetupChoice(usize),
     SetupBack,
     SetupNext,
@@ -509,6 +521,10 @@ struct App {
     dash: bool,
     dash_scroll: u16,
     help: bool,
+    /// the About screen is open: what this build is (its date and subject)
+    about: Option<String>,
+    /// quit and start the newly installed chud in this one's place
+    restart: bool,
     menu: Option<Menu>,
     focused: bool,
     quit: bool,
@@ -577,10 +593,29 @@ fn main() -> Result<()> {
     let res = run(&mut term);
     let _ = modes();
     ratatui::restore();
-    res
+    match res {
+        Ok(true) => restart(),
+        res => res.map(drop),
+    }
 }
 
-fn run(term: &mut Term) -> Result<()> {
+/// Starts the chud just installed in this one's place: the same process in the same terminal,
+/// so chud.app keeps its window. The sessions closed on the way out, and come back the way a
+/// restart brings them back.
+#[cfg(unix)]
+fn restart() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let chud = std::env::current_exe()?;
+    Err(Command::new(chud).exec().into()) // only comes back if it couldn't
+}
+
+#[cfg(not(unix))]
+fn restart() -> Result<()> {
+    Ok(()) // not offered: updating itself is macOS-only
+}
+
+/// Runs chud until you quit; true when it should start again as the chud just installed.
+fn run(term: &mut Term) -> Result<bool> {
     let (tx, rx) = mpsc::channel();
     let input_tx = tx.clone();
     std::thread::spawn(move || {
@@ -674,9 +709,9 @@ fn run(term: &mut Term) -> Result<()> {
         if typed {
             last_input = Instant::now();
         }
-        if app.quit {
+        if app.quit || app.restart {
             app.save();
-            return Ok(());
+            return Ok(app.restart);
         }
         if ticking && last.elapsed() >= TICK {
             app.tick();
@@ -722,6 +757,8 @@ impl App {
             dash: false,
             dash_scroll: 0,
             help: false,
+            about: None,
+            restart: false,
             menu: None,
             focused: true,
             quit: false,
@@ -789,8 +826,11 @@ impl App {
                 true
             }
             Event::Updated(u) => {
-                if let update::Update::Ready(commit) = &u {
-                    notify("chud updated", &format!("{commit} is installed · quit and start chud again"));
+                // once, when it lands: later checks find the same install and say so again
+                if let update::Update::Ready(commit) = &u
+                    && self.update.as_ref() != Some(&u)
+                {
+                    notify("chud updated", &format!("{commit} is installed · restart it from About (C-a a)"));
                 }
                 self.update = Some(u);
                 true
@@ -950,6 +990,13 @@ impl App {
         if self.setup.is_some() {
             return self.setup_key(k);
         }
+        if self.about.is_some() {
+            return self.about_act(match k.code {
+                KeyCode::Char('c') => AboutAct::Check,
+                KeyCode::Char('r') => AboutAct::Restart,
+                _ => AboutAct::Close,
+            });
+        }
         if self.help || self.menu.is_some() {
             (self.help, self.menu) = (false, None);
             return;
@@ -1031,6 +1078,7 @@ impl App {
             KeyCode::Char('d') => self.tool(Tool::Diff),
             KeyCode::Char('s') => self.tool(Tool::Dash),
             KeyCode::Char('?') => self.tool(Tool::Help),
+            KeyCode::Char('a') => self.tool(Tool::About),
             KeyCode::Char('r') if has => self.prompt = ask(Ask::Rename, self.sessions[self.sel].label()),
             KeyCode::Char('g') if has => self.prompt = ask(Ask::Group, String::new()),
             KeyCode::Char('G') if has => self.run_act(Act::GroupRename(self.cur_group())),
@@ -1095,6 +1143,14 @@ impl App {
             Tool::Diff if self.diff.is_some() => self.diff = None,
             Tool::Diff => self.open_diff(),
             Tool::Help => self.help = true,
+            Tool::About => {
+                self.about = Some(update::describe().unwrap_or_default());
+                self.help = false;
+                // opening it is asking: unless the last check put a new chud in already
+                if !matches!(self.update, Some(update::Update::Ready(_) | update::Update::Installing(_))) {
+                    update::check_now(&self.tx);
+                }
+            }
         }
     }
 
@@ -1139,7 +1195,7 @@ impl App {
     fn accept_prompt(&mut self) {
         if let Some(Prompt { ask, input, .. }) = self.prompt.take() {
             match ask {
-                Ask::Kill | Ask::Discard | Ask::Quit => self.confirm(ask),
+                Ask::Kill | Ask::Discard | Ask::Quit | Ask::Restart => self.confirm(ask),
                 _ => self.submit(ask, input.trim()),
             }
         }
@@ -1197,6 +1253,7 @@ impl App {
                 }
             }
             Ask::Quit => self.quit = true,
+            Ask::Restart => self.restart = true,
             _ => {}
         }
     }
@@ -1875,6 +1932,25 @@ impl App {
         self.flash = Some(format!(" setup saved to {} · run chud --setup to change it ", config::path().display()));
     }
 
+    fn about_act(&mut self, act: AboutAct) {
+        match act {
+            AboutAct::Check if !matches!(self.update, Some(update::Update::Installing(_) | update::Update::Checking)) => {
+                update::check_now(&self.tx)
+            }
+            AboutAct::Restart if matches!(self.update, Some(update::Update::Ready(_))) && cfg!(unix) => {
+                self.about = None;
+                // agents mid-turn would be stopped: ask first; idle ones come straight back
+                let busy = self.sessions.iter().filter(|s| matches!(s.status(), Status::Working | Status::NeedsInput)).count();
+                match busy {
+                    0 => self.restart = true,
+                    _ => self.prompt = Some(Prompt::new(Ask::Restart, String::new())),
+                }
+            }
+            AboutAct::Close => self.about = None,
+            _ => {}
+        }
+    }
+
     fn press(&mut self, hit: Option<Hit>, m: MouseEvent) {
         if self.setup.is_some() {
             match hit {
@@ -1884,6 +1960,12 @@ impl App {
                 _ => {}
             }
             return;
+        }
+        if self.about.is_some() {
+            return self.about_act(match hit {
+                Some(Hit::About(act)) => act,
+                _ => AboutAct::Close, // a click anywhere else closes it
+            });
         }
         if self.help {
             self.help = false;

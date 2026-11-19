@@ -20,9 +20,10 @@ It runs as a TUI inside any terminal, or as its own macOS app with bundled fonts
 | **Plan usage header** | Claude's or Codex's rolling 5-hour limit with a reset countdown plus the weekly %, or Copilot's monthly premium requests. |
 | **Context fullness** | Per-session bar in the sidebar showing how full each agent's context window is. |
 | **Groups** | Put sessions in named, foldable groups; drag sessions to reorder or regroup them. |
-| **Dashboard** | Summary page with token charts, working time, and every agent's chud. |
+| **Dashboard** | Summary page with token charts, working time, and every agent's chud — for Claude, Copilot and Codex alike. |
 | **Diff review** | See the repo's changed files, then commit or discard without leaving chud. |
-| **Copy and paste** | Drag over the terminal to select and copy; ⌘V pastes. `C-a y` copies the whole session view. |
+| **Copy and paste** | Drag over the terminal to select and copy; hold past the pane's edge and it keeps scrolling, in Claude and Copilot too. ⌘V pastes. `C-a y` copies the whole session view. |
+| **Updates itself** | Checks GitHub every half hour and whenever you open **About**, builds the new version in the background, and restarts into it at a click, sessions and all. |
 | **Mouse-first UI** | Toolbar, `…` and right-click menus, drag and drop, resizable sidebar. Every action also has a keyboard shortcut. |
 | **Restore on restart** | Layout, groups, names and agent chats come back the next time you run `chud` — including a Claude or Copilot chat you started by hand in a terminal, which reopens in the folder it ran in. |
 | **A chud per session** | Every agent's header carries its own chud, as fat as its context is full, running on a treadmill while Claude compacts the conversation. Click it to pet it. The dashboard shows the full-size one. |
@@ -122,6 +123,7 @@ Every shortcut starts with the `Ctrl-a` prefix:
 | `C-a w` | Close this pane (the session keeps running) |
 | `C-a d` | Diff review (`c` commit, `r` discard, `R` refresh) |
 | `C-a s` | Dashboard |
+| `C-a a` | About: the version you're running, a check for a newer one, and restart into it |
 | `C-a x` | Kill session |
 | `C-a q` | Quit (running `chud` again restores everything) |
 | `C-a C-a` | Send a literal `Ctrl-a` |

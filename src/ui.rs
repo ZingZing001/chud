@@ -4,7 +4,7 @@ use crate::theme::p as pal;
 use crate::update::Update;
 use crate::usage::{local_minute, now_secs, Plan, Window};
 use crate::setup::{Check, StatusLine};
-use crate::{App, Ask, Diff, DiffAct, Drag, Hit, Menu, Prompt, Row, Setup, Tool, SETUP_STEPS};
+use crate::{AboutAct, App, Ask, Diff, DiffAct, Drag, Hit, Menu, Prompt, Row, Setup, Tool, SETUP_STEPS};
 use ratatui::prelude::*;
 use ratatui::symbols::Marker;
 use ratatui::widgets::{
@@ -199,6 +199,10 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
     if app.help {
         help(f);
         hits.push((f.area(), Hit::Backdrop));
+    }
+    if let Some(built) = &app.about {
+        hits.push((f.area(), Hit::Backdrop));
+        about(f, app, built, &mut hits);
     }
     if let Some(p) = &app.prompt {
         prompt(f, p, &mut hits);
@@ -524,6 +528,7 @@ fn toolbar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         (" ▦ Dashboard ", Tool::Dash, app.dash),
         (" ± Diff ", Tool::Diff, app.diff.is_some()),
         (" ? Help ", Tool::Help, app.help),
+        (" About ", Tool::About, app.about.is_some()),
     ];
     for (text, tool, on) in buttons {
         let w = text.chars().count() as u16;
@@ -950,9 +955,10 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         (None, _) => vec![keys],
     };
     match &app.update {
-        Some(Update::Ready(commit)) => spans.push(format!(" ⟳ {commit} installed · restart chud ").black().on_green()),
+        Some(Update::Ready(commit)) => spans.push(format!(" ⟳ {commit} installed · C-a a to restart into it ").black().on_green()),
+        Some(Update::Installing(commit)) => spans.push(format!(" ⟳ installing {commit}… ").fg(pal().dim)),
         Some(Update::Failed(why)) => spans.push(format!(" ⟳ update failed: {why} ").black().on_red()),
-        None => {}
+        _ => {} // checking, nothing new, or can't: About says so when you look
     }
     f.render_widget(Line::from(spans).fg(pal().bar_fg).bg(pal().bar_bg), area);
 }
@@ -1002,10 +1008,76 @@ const HELP: &[(&str, &str)] = &[
     ("C-a d", "diff review (c commit, r discard, R refresh)"),
     ("C-a s", "summary dashboard"),
     ("C-a x", "kill session"),
+    ("C-a a", "about chud: its version, and a check for a newer one"),
     ("C-a q", "quit; running `chud` alone restores the layout"),
     ("C-a C-a", "send a literal Ctrl-a"),
     ("chud --setup", "run the first-start walkthrough again"),
 ];
+
+/// What chud this is, and whether there is a newer one: opening it checks, and installs one if
+/// there is. Once it is in, Restart starts it in this chud's place.
+fn about(f: &mut Frame, app: &App, built: &str, hits: &mut Hits) {
+    let version = match crate::update::built() {
+        Some(commit) => format!(" Version {commit}{}", if built.is_empty() { String::new() } else { format!(" · {built}") }),
+        None => " A build made without bundle.sh: no version to show".into(),
+    };
+    let home = crate::config::home();
+    let from = crate::update::source()
+        .map(|p| p.strip_prefix(&home).map_or(p.display().to_string(), |rest| format!("~/{}", rest.display())))
+        .map(|p| format!(" Built from {p}"))
+        .unwrap_or_default();
+    let (status, colour) = match &app.update {
+        None | Some(Update::Checking) => ("Checking for a newer chud…".to_string(), pal().dim),
+        Some(Update::Current) => ("You have the newest chud.".into(), pal().bar_fg),
+        Some(Update::Installing(c)) => (format!("Installing {c}… this takes a few minutes. chud keeps working meanwhile."), pal().bar_fg),
+        Some(Update::Ready(c)) => (format!("{c} is installed. Restart to use it: your sessions come back."), pal().accent),
+        Some(Update::Failed(why)) => (format!("Couldn't update: {why}"), pal().bar_fg),
+        Some(Update::Unavailable(why)) => (format!("chud can't update itself: {why}"), pal().bar_fg),
+    };
+    let mut lines = vec![
+        Line::from(" chud".bold()),
+        Line::from(" A terminal for your AI coding agents".fg(pal().dim)),
+        Line::default(),
+        Line::from(version),
+    ];
+    if !from.is_empty() {
+        lines.push(Line::from(from.fg(pal().dim)));
+    }
+    lines.extend([Line::default(), Line::from(format!(" {status} ").fg(colour))]);
+    let a = f.area();
+    let text_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (text_w + 3).clamp(56, 90).min(a.width);
+    // each line as many rows as it wraps to, then a blank row and the buttons, inside the border
+    let rows: u16 = lines.iter().map(|l| (l.width() as u16).div_ceil(w.saturating_sub(2).max(1)).max(1)).sum();
+    let h = (rows + 4).min(a.height);
+    let r = Rect::new((a.width - w) / 2, (a.height - h) / 3, w, h);
+    f.render_widget(Clear, r);
+    let block = Block::bordered().title(" About ").border_style(pal().dim);
+    let inner = block.inner(r);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), r);
+    // the buttons along the bottom, the one that matters now lit
+    let ready = matches!(app.update, Some(Update::Ready(_))) && cfg!(unix);
+    let busy = matches!(app.update, None | Some(Update::Checking | Update::Installing(_)));
+    let mut buttons = vec![];
+    if ready {
+        buttons.push((" Restart now ", AboutAct::Restart, true));
+    } else if !busy {
+        buttons.push((" Check again ", AboutAct::Check, false));
+    }
+    buttons.push((" Close ", AboutAct::Close, !ready));
+    let y = inner.bottom().saturating_sub(1);
+    let mut x = inner.x + 1;
+    for (text, act, lit) in buttons {
+        let w = text.chars().count() as u16;
+        let style = if lit { text.fg(pal().on_accent).bg(pal().accent) } else { text.fg(pal().bar_fg).bg(pal().button_bg) };
+        f.render_widget(style, Rect::new(x, y, w, 1));
+        hits.push((Rect::new(x, y, w, 1), Hit::About(act)));
+        x += w + 2;
+    }
+    let keys = if ready { "r restart · Esc close" } else if busy { "Esc close" } else { "c check again · Esc close" };
+    let kw = keys.chars().count() as u16;
+    f.render_widget(Span::from(keys).fg(pal().dim), Rect::new(inner.right().saturating_sub(kw + 1), y, kw, 1));
+}
 
 /// Every key and what it does, sized to the longest of each so nothing runs together or off
 /// the edge; in a window too narrow for that, descriptions wrap under themselves.
@@ -1055,6 +1127,7 @@ fn prompt(f: &mut Frame, p: &Prompt, hits: &mut Hits) {
         Ask::Kill => " kill this session? ",
         Ask::Discard => " discard all changes to this file? ",
         Ask::Quit => " sessions still running, quit and kill them? ",
+        Ask::Restart => " agents are working: restart anyway? they stop, then come back ",
     };
     let yes_no = p.yes_no();
     let text = if yes_no { " ← → to choose · enter to confirm".to_string() } else { format!("{}▏", p.input) };

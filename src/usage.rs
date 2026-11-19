@@ -31,6 +31,9 @@ pub struct Usage {
     /// codex reports its own plan windows in its log: the 5-hour one, and the week
     pub limits: Option<(Window, Option<Window>)>,
     prompt_limit: u64,
+    /// the log counts each request in a `session.usage_record` (Copilot from 1.0.9x on), so
+    /// the token counts older logs put on each message are not looked for
+    records: bool,
     kind: Kind,
     path: PathBuf,
     offset: u64,
@@ -285,7 +288,10 @@ impl Usage {
             self.prompt_limit = n;
         }
         let head = line.get(..48).unwrap_or(line);
-        if head.contains("\"assistant.message\"") {
+        if head.contains("\"session.usage_record\"") {
+            return self.copilot_request(line);
+        }
+        if head.contains("\"assistant.message\"") && !self.records {
             // these lines are large (full message + reasoning); skip the JSON parse
             let out = number_after(line, "\"outputTokens\":").unwrap_or(0);
             self.output += out;
@@ -305,10 +311,12 @@ impl Usage {
         if let Some(m) = model.or(d["modelCacheState"][0]["modelId"].as_str()) {
             self.model = m.to_string();
         }
-        if let Some(n) = d["totalNanoAiu"].as_u64() {
+        // newer logs write these totals as strings
+        let number = |v: &Value| v.as_u64().or_else(|| v.as_str()?.parse().ok());
+        if let Some(n) = number(&d["totalNanoAiu"]) {
             self.credits = n as f64 / 1e9;
         }
-        if let Some(n) = d["totalPremiumRequests"].as_u64() {
+        if let Some(n) = number(&d["totalPremiumRequests"]) {
             self.premium = n;
         }
         let prompt = || d["promptCacheBreakState"][0]["models"].as_object()?.values().next()?["prompt_tokens"].as_u64();
@@ -316,9 +324,37 @@ impl Usage {
             self.context = n;
         }
         // only the shutdown summary carries input-side totals
-        if d.get("tokenDetails").is_some() {
+        if d.get("tokenDetails").is_some() && !self.records {
             let t = |k: &str| d["tokenDetails"][k]["tokenCount"].as_u64().unwrap_or(0);
             (self.input, self.cached) = (t("input") + t("cache_write"), t("cache_read"));
+        }
+    }
+}
+
+impl Usage {
+    /// One request to the model, as newer Copilot logs record it: what went in (cache reads
+    /// apart, as Claude's are), what came out, and the model and its prompt limit.
+    fn copilot_request(&mut self, line: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        let u = &v["data"]["usage"];
+        let n = |k: &str| u[k].as_u64().unwrap_or(0);
+        let (input, read, output) = (n("inputTokens"), n("cacheReadTokens"), n("outputTokens"));
+        self.records = true;
+        self.input += input.saturating_sub(read);
+        self.cached += read;
+        self.output += output;
+        let minute = v["timestamp"].as_str().and_then(epoch_minute).unwrap_or(0);
+        *self.timeline.entry(minute).or_default() += output;
+        // what the conversation itself sent is what fills its window; a side request (a title,
+        // a summary) says nothing about that
+        if u["interactionType"].as_str().is_none_or(|t| t == "conversation-agent") {
+            self.context = input;
+            if let Some(limit) = u["maxPromptTokens"].as_u64() {
+                self.prompt_limit = limit;
+            }
+            if let Some(model) = u["model"].as_str() {
+                self.model = model.to_string();
+            }
         }
     }
 }
@@ -507,6 +543,36 @@ mod tests {
         assert!((u.credits - 135.47169).abs() < 1e-6);
         let m = epoch_minute("2026-09-14T10:01:00Z").unwrap();
         assert_eq!(u.timeline.get(&m), Some(&500));
+    }
+
+    /// Copilot from 1.0.9x on: a usage record per request, totals written as strings, and no
+    /// token counts on the messages.
+    #[test]
+    fn copilot_usage_records() {
+        let record = |at: &str, input: u64, read: u64, output: u64, kind: &str| {
+            format!(
+                r#"{{"type":"session.usage_record","data":{{"usage":{{"model":"claude-fable-5.1","inputTokens":{input},"outputTokens":{output},"cacheReadTokens":{read},"cacheWriteTokens":0,"maxPromptTokens":200000,"interactionType":"{kind}"}}}},"timestamp":"2026-11-02T03:{at}.000Z"}}"#
+            ) + "\n"
+        };
+        let p = tmp(
+            "records.jsonl",
+            &[
+                r#"{"type":"assistant.message","data":{"messageId":"m1","content":"hi","model":"claude-fable-5.1"},"timestamp":"2026-11-02T03:52:30.000Z"}"#.to_string() + "\n",
+                record("52:39", 41611, 0, 335, "conversation-agent"),
+                record("53:10", 42000, 41000, 120, "conversation-agent"),
+                record("53:20", 500, 0, 15, "title-generation"),
+                r#"{"type":"session.usage_checkpoint","data":{"totalNanoAiu":"231022275000","totalPremiumRequests":"15"}}"#.to_string() + "\n",
+            ]
+            .concat(),
+        );
+        let mut u = Usage::default();
+        u.refresh(&p, Kind::Copilot);
+        assert_eq!((u.output, u.input, u.cached), (470, 41611 + 1000 + 500, 41000));
+        assert_eq!((u.context, u.limit(), u.model.as_str()), (42000, 200_000, "claude-fable-5.1"), "the conversation's last request, not the title");
+        assert_eq!(u.premium, 15);
+        assert!((u.credits - 231.022275).abs() < 1e-6);
+        assert_eq!(u.timeline.get(&epoch_minute("2026-11-02T03:52:00Z").unwrap()), Some(&335));
+        assert_eq!(u.timeline.get(&epoch_minute("2026-11-02T03:53:00Z").unwrap()), Some(&135));
     }
 
     /// The window comes from the agent; the guess only fills the gap before it speaks.
